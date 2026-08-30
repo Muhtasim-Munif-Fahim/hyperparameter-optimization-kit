@@ -6,7 +6,9 @@ build-backend = "setuptools.build_meta"
 name = "hyperopt-kit"
 version = "0.1.0"
 description = "A lightweight hyperparameter optimization toolkit with grid, random and Gaussian-process bayesian search."
+readme = "README.md"
 requires-python = ">=3.9"
+license = "MIT"
 dependencies = ["numpy>=1.21"]
 
 [project.scripts]

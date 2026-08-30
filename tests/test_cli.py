@@ -1,0 +1,184 @@
+import json
+
+import pytest
+
+from hyperopt_kit.cli import build_parser, main
+
+SPACE = json.dumps({"a": [0.1, 5.0], "b": [0.1, 5.0]})
+
+
+def test_build_parser_has_subcommands():
+    parser = build_parser()
+    sub = {action.dest: action for action in parser._actions}
+    assert "search" in parser._subparsers._group_actions[0].choices
+
+
+def test_search_random_subcommand(capsys):
+    rc = main(
+        ["search", "--space", SPACE, "--objective", "demo", "--budget", "10",
+         "--strategy", "random", "--seed", "1"]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "strategy: random" in out
+    assert "trials: 10" in out
+    assert "best score:" in out
+    assert "best parameters:" in out
+
+
+def test_search_bayesian_subcommand(capsys):
+    rc = main(
+        ["search", "--space", SPACE, "--objective", "demo", "--budget", "12",
+         "--strategy", "bayesian", "--seed", "2"]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "strategy: bayesian" in out
+
+
+def test_search_grid_subcommand(capsys):
+    rc = main(
+        ["search", "--space", SPACE, "--objective", "demo", "--budget", "10",
+         "--strategy", "grid"]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "strategy: grid" in out
+
+
+def test_search_deterministic_with_same_seed(capsys):
+    main(["search", "--space", SPACE, "--objective", "demo", "--budget", "10",
+          "--strategy", "bayesian", "--seed", "5"])
+    first = capsys.readouterr().out
+    main(["search", "--space", SPACE, "--objective", "demo", "--budget", "10",
+          "--strategy", "bayesian", "--seed", "5"])
+    second = capsys.readouterr().out
+    assert first == second
+
+
+def test_search_floor_stops_early(capsys):
+    rc = main(
+        ["search", "--space", SPACE, "--objective", "demo", "--budget", "30",
+         "--strategy", "random", "--seed", "1", "--floor", "1000.0"]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "trials: 1" in out
+
+
+def test_search_patience_config_accepted(capsys):
+    rc = main(
+        ["search", "--space", SPACE, "--objective", "demo", "--budget", "30",
+         "--strategy", "random", "--seed", "1", "--patience", "5"]
+    )
+    assert rc == 0
+
+
+def test_compare_subcommand_prints_table(capsys):
+    rc = main(
+        ["compare", "--space", SPACE, "--objective", "demo", "--budget", "8", "--seed", "3"]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "| strategy |" in out
+    assert "| grid |" in out
+    assert "| random |" in out
+    assert "| bayesian |" in out
+
+
+def test_compare_with_custom_strategies(capsys):
+    rc = main(
+        ["compare", "--space", SPACE, "--objective", "demo", "--budget", "8",
+         "--seed", "3", "--strategies", "random,bayesian"]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "| random |" in out
+    assert "| bayesian |" in out
+    assert "| grid |" not in out
+
+
+def test_report_subcommand_writes_file(tmp_path, capsys):
+    out = tmp_path / "nested" / "report.md"
+    rc = main(
+        ["report", "--space", SPACE, "--objective", "demo", "--budget", "8",
+         "--seed", "4", "--out", str(out)]
+    )
+    captured = capsys.readouterr().out
+    assert rc == 0
+    assert "wrote report to" in captured
+    text = out.read_text(encoding="utf-8")
+    assert "# " in text
+    assert "## Results" in text
+    assert "## Learning curves" in text
+    assert "## Parameter importance" in text
+
+
+def test_report_default_output_file(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    rc = main(
+        ["report", "--space", SPACE, "--objective", "demo", "--budget", "6", "--seed", "1"]
+    )
+    assert rc == 0
+    assert (tmp_path / "hyperopt_report.md").exists()
+
+
+def test_objective_from_dotted_path(capsys):
+    rc = main(
+        ["search", "--space", SPACE, "--objective", "hyperopt_kit.objectives:demo_objective",
+         "--budget", "6", "--strategy", "random", "--seed", "1"]
+    )
+    assert rc == 0
+
+
+def test_space_from_json_file(tmp_path, capsys):
+    space_file = tmp_path / "space.json"
+    space_file.write_text(SPACE, encoding="utf-8")
+    rc = main(
+        ["search", "--space", f"@{space_file}", "--objective", "demo", "--budget", "6",
+         "--strategy", "random", "--seed", "1"]
+    )
+    assert rc == 0
+
+
+def test_no_command_exits_nonzero():
+    with pytest.raises(SystemExit):
+        main([])
+
+
+def test_unknown_strategy_exits_nonzero():
+    with pytest.raises(SystemExit):
+        main(
+            ["search", "--space", SPACE, "--objective", "demo", "--budget", "5",
+             "--strategy", "grid-search"]
+        )
+
+
+def test_bad_objective_exits_nonzero():
+    with pytest.raises(SystemExit):
+        main(
+            ["search", "--space", SPACE, "--objective", "no.such.module:fn",
+             "--budget", "5"]
+        )
+
+
+def test_invalid_space_exits_nonzero():
+    with pytest.raises(SystemExit):
+        main(
+            ["search", "--space", "{not json", "--objective", "demo", "--budget", "5"]
+        )
+
+
+def test_budget_zero_rejected():
+    with pytest.raises(SystemExit):
+        main(
+            ["search", "--space", SPACE, "--objective", "demo", "--budget", "0"]
+        )
+
+
+def test_empty_strategies_rejected():
+    with pytest.raises(SystemExit):
+        main(
+            ["compare", "--space", SPACE, "--objective", "demo", "--budget", "5",
+             "--strategies", ","]
+        )
