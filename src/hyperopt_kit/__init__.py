@@ -1,5 +1,7 @@
 """hyperopt-kit: a lightweight hyperparameter optimization toolkit."""
 
+from .evaluate import RunResult, compare_strategies, run_search
+from .report import render_report, write_report
 from .searchers import (
     GaussianProcess,
     Trial,
@@ -17,11 +19,16 @@ __all__ = [
     "FloatRange",
     "GaussianProcess",
     "IntRange",
+    "RunResult",
     "Space",
     "Trial",
     "bayesian_search",
+    "compare_strategies",
     "expected_improvement",
     "grid_search",
     "parse_space",
     "random_search",
+    "render_report",
+    "run_search",
+    "write_report",
 ]
