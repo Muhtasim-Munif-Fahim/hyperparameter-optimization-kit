@@ -11,7 +11,9 @@ from .searchers import (
     Trial,
     bayesian_search,
     grid_search,
+    hyperband_search,
     random_search,
+    successive_halving,
 )
 from .spaces import Space
 
@@ -19,7 +21,22 @@ _STRATEGIES = {
     "grid": grid_search,
     "random": random_search,
     "bayesian": bayesian_search,
+    "hyperband": hyperband_search,
+    "successive_halving": successive_halving,
 }
+
+_STRATEGY_KWARGS = {
+    "grid": ("grid_points_per_dim",),
+    "random": (),
+    "bayesian": ("xi", "n_initial", "n_candidates"),
+    "hyperband": ("eta", "min_resource", "max_resource"),
+    "successive_halving": ("eta", "min_resource", "max_resource", "n_candidates"),
+}
+
+
+def available_strategies() -> List[str]:
+    """Strategy names accepted by :func:`run_search` and :func:`compare_strategies`."""
+    return list(_STRATEGIES)
 
 
 @dataclass(frozen=True)
@@ -33,9 +50,28 @@ class RunResult:
 
 
 def best_trial(trials: List[Trial]) -> Trial:
-    """The trial with the lowest score (minimize convention)."""
+    """The trial with the lowest score (minimize convention).
+
+    When trials record a ``resource`` fidelity, the winner is chosen among
+    the highest-resource evaluations so a lucky cheap partial-run cannot
+    beat a full-fidelity score.
+    """
     if not trials:
         raise ValueError("no trials available")
+    resources = [
+        t.resource
+        for t in trials
+        if getattr(t, "resource", None) is not None
+    ]
+    if resources:
+        r_max = max(resources)
+        candidates = [
+            t
+            for t in trials
+            if getattr(t, "resource", None) is not None and t.resource >= r_max - 1e-12
+        ]
+        if candidates:
+            return min(candidates, key=lambda t: t.score)
     return min(trials, key=lambda t: t.score)
 
 
@@ -48,13 +84,13 @@ def best_params(trials: List[Trial]) -> Dict:
 
 
 def learning_curve(trials: List[Trial]) -> List[float]:
-    """Best-so-far score after each evaluation (monotone non-increasing)."""
-    best = float("inf")
-    curve: List[float] = []
-    for trial in trials:
-        best = min(best, trial.score)
-        curve.append(best)
-    return curve
+    """Best-so-far score after each evaluation.
+
+    For single-fidelity runs this is monotone non-increasing. When trials
+    record a ``resource``, each point is the best score among the
+    highest-resource evaluations seen so far (matching :func:`best_trial`).
+    """
+    return [best_trial(trials[: i + 1]).score for i in range(len(trials))]
 
 
 class EarlyStopper:
@@ -110,11 +146,9 @@ def run_search(
     rng = rng if rng is not None else np.random.default_rng(seed)
     stopper = make_stopper(floor=floor, patience=patience)
     searcher = _STRATEGIES[strategy]
-    if strategy == "bayesian":
-        allowed = {k: kwargs[k] for k in ("xi", "n_initial", "n_candidates") if k in kwargs}
-        trials = searcher(space, objective, budget, rng=rng, stop_when=stopper, **allowed)
-    else:
-        trials = searcher(space, objective, budget, rng=rng, stop_when=stopper)
+    allowed_names = _STRATEGY_KWARGS.get(strategy, ())
+    allowed = {k: kwargs[k] for k in allowed_names if k in kwargs}
+    trials = searcher(space, objective, budget, rng=rng, stop_when=stopper, **allowed)
     return RunResult(
         strategy=strategy,
         trials=trials,
@@ -127,7 +161,7 @@ def compare_strategies(
     space: Dict[str, Space],
     objective,
     budget: int,
-    strategies: Iterable[str] = ("grid", "random", "bayesian"),
+    strategies: Iterable[str] = ("grid", "random", "bayesian", "hyperband"),
     rng: Optional[np.random.Generator] = None,
     *,
     seed: Optional[int] = None,
