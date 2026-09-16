@@ -182,6 +182,11 @@ def render_report(
         "- Log-scale ranges are sampled and mutated on the log axis, so "
         "equal steps in normalized space are multiplicative on the raw scale."
     )
+    lines.append(
+        "- Hyperband / successive-halving evaluate the same configuration at "
+        "increasing fidelities; reported best scores use the highest-resource "
+        "rung so a lucky cheap evaluation cannot win the comparison."
+    )
     if strategy_notes:
         for note in strategy_notes:
             lines.append(f"- {note}")

@@ -2,31 +2,40 @@
 
 ``grid_search`` and ``random_search`` are self-explanatory baselines;
 ``bayesian_search`` fits a squared-exponential Gaussian-process surrogate
-and picks the next configuration by maximizing expected improvement.
+and picks the next configuration by maximizing expected improvement;
+``hyperband_search`` / ``successive_halving`` run multi-fidelity brackets
+that spend cheap evaluations to discard poor configurations early.
 """
 
 from __future__ import annotations
 
+import inspect
 import itertools
 import math
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
 from .spaces import Categorical, FloatRange, IntRange, Space
 
-ScoreFn = Callable[[Dict[str, Any]], float]
+ScoreFn = Callable[..., float]
 Stopper = Optional[Callable[[float, int], bool]]
 
 
 @dataclass(frozen=True)
 class Trial:
-    """One evaluated configuration."""
+    """One evaluated configuration.
+
+    ``resource`` is the normalized fidelity in ``(0, 1]`` used for this
+    evaluation (``1.0`` is full fidelity). Single-fidelity searchers leave
+    it as ``None``.
+    """
 
     iteration: int
     params: Dict[str, Any]
     score: float
+    resource: Optional[float] = None
 
 
 def _validate_space(space: Dict[str, Space]) -> None:
@@ -317,4 +326,242 @@ def bayesian_search(
             X = np.vstack([X, candidates[idx][None, :]])
             y = np.append(y, score)
             gp.fit(X, y)
+    return trials
+
+
+def _validate_hyperband_params(eta: int, min_resource: int, max_resource: int) -> None:
+    if int(eta) != eta or eta < 2:
+        raise ValueError("eta must be an integer >= 2")
+    if int(min_resource) != min_resource or min_resource < 1:
+        raise ValueError("min_resource must be an integer >= 1")
+    if int(max_resource) != max_resource or max_resource < min_resource:
+        raise ValueError("max_resource must be an integer >= min_resource")
+
+
+def _resource_caller(objective: ScoreFn) -> Callable[[Dict[str, Any], float], float]:
+    """Adapt ``objective(params)`` or ``objective(params, resource=...)``."""
+
+    def _single(params: Dict[str, Any], resource: float) -> float:
+        return float(objective(params))
+
+    try:
+        signature = inspect.signature(objective)
+    except (TypeError, ValueError):
+        return _single
+
+    parameters = signature.parameters
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+        return lambda params, resource: float(objective(params, resource=resource))
+    if "resource" in parameters:
+        return lambda params, resource: float(objective(params, resource=resource))
+    if "fidelity" in parameters:
+        return lambda params, resource: float(objective(params, fidelity=resource))
+
+    positional = [
+        p
+        for p in parameters.values()
+        if p.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    if len(positional) >= 2:
+        return lambda params, resource: float(objective(params, resource))
+    return _single
+
+
+def hyperband_brackets(
+    max_resource: int = 9,
+    eta: int = 3,
+    min_resource: int = 1,
+) -> List[Tuple[int, int, float]]:
+    """Return Hyperband brackets as ``(s, n, r)`` from largest ``s`` to 0.
+
+    ``s`` is the number of successive-halving rungs minus one, ``n`` is how
+    many configurations the bracket samples, and ``r`` is the starting
+    resource (before multiplying by ``eta`` at each rung). ``max_resource``
+    is the paper's ``R``; ``eta`` is the downsampling rate.
+    """
+    _validate_hyperband_params(eta, min_resource, max_resource)
+    s_max = int(math.floor(math.log(max_resource / min_resource, eta)))
+    budget_units = (s_max + 1) * max_resource
+    brackets: List[Tuple[int, int, float]] = []
+    for s in range(s_max, -1, -1):
+        n = int(math.ceil(budget_units / max_resource * (eta**s) / (s + 1)))
+        r = max(float(min_resource), float(max_resource) * (eta ** (-s)))
+        brackets.append((s, n, r))
+    return brackets
+
+
+def _run_sh_bracket(
+    *,
+    space: Dict[str, Space],
+    evaluate: Callable[[Dict[str, Any], float], float],
+    rng: np.random.Generator,
+    n: int,
+    r: float,
+    s: int,
+    eta: int,
+    max_resource: int,
+    trials: List[Trial],
+    budget: int,
+    stop_when: Stopper,
+) -> bool:
+    """Run one successive-halving bracket.
+
+    Returns True when the search should stop (budget exhausted or
+    ``stop_when`` fired).
+    """
+    if n < 1 or len(trials) >= budget:
+        return len(trials) >= budget
+
+    configs: List[Dict[str, Any]] = [_sample_config(space, rng) for _ in range(int(n))]
+    for i in range(s + 1):
+        if not configs or len(trials) >= budget:
+            break
+        n_i = min(len(configs), max(1, int(math.floor(n * (eta ** (-i))))))
+        r_i = min(float(max_resource), r * (eta**i))
+        fidelity = float(r_i) / float(max_resource)
+        configs = configs[:n_i]
+        scores: List[float] = []
+        for params in configs:
+            if len(trials) >= budget:
+                return True
+            score = float(evaluate(params, fidelity))
+            trials.append(
+                Trial(len(trials), dict(params), score, resource=fidelity)
+            )
+            scores.append(score)
+            if stop_when is not None and stop_when(_best_score(trials), len(trials)):
+                return True
+        if i < s and scores:
+            k = max(1, int(math.floor(len(configs) / eta)))
+            k = min(k, len(configs))
+            order = sorted(range(len(scores)), key=lambda j: scores[j])
+            configs = [configs[j] for j in order[:k]]
+    return len(trials) >= budget
+
+
+def successive_halving(
+    space: Dict[str, Space],
+    objective: ScoreFn,
+    budget: int,
+    rng: Optional[np.random.Generator] = None,
+    stop_when: Stopper = None,
+    *,
+    eta: int = 3,
+    min_resource: int = 1,
+    max_resource: int = 9,
+    n_candidates: Optional[int] = None,
+) -> List[Trial]:
+    """Successive Halving: one multi-fidelity bracket, repeated to fill ``budget``.
+
+    Configurations are sampled from ``space`` and evaluated at geometrically
+    increasing resources. After each rung the worst ``1 - 1/eta`` fraction is
+    discarded. Resource is passed to ``objective`` as a normalized fidelity
+    in ``(0, 1]`` (``1.0`` = full fidelity) when the callable accepts a
+    ``resource`` / ``fidelity`` argument; otherwise the objective is called
+    with params only.
+
+    ``budget`` counts objective evaluations, matching grid / random / GP.
+    """
+    _validate_space(space)
+    if budget < 1:
+        raise ValueError("budget must be >= 1")
+    _validate_hyperband_params(eta, min_resource, max_resource)
+    rng = rng if rng is not None else np.random.default_rng()
+
+    brackets = hyperband_brackets(max_resource, eta, min_resource)
+    s, n_default, r = brackets[0]
+    n = int(n_candidates) if n_candidates is not None else n_default
+    if n < 1:
+        raise ValueError("n_candidates must be >= 1")
+
+    evaluate = _resource_caller(objective)
+    trials: List[Trial] = []
+    while len(trials) < budget:
+        remaining = budget - len(trials)
+        n_use = min(n, remaining)
+        stopped = _run_sh_bracket(
+            space=space,
+            evaluate=evaluate,
+            rng=rng,
+            n=n_use,
+            r=r,
+            s=s,
+            eta=eta,
+            max_resource=max_resource,
+            trials=trials,
+            budget=budget,
+            stop_when=stop_when,
+        )
+        if stopped:
+            break
+        if n_use < 1:
+            break
+    return trials
+
+
+def hyperband_search(
+    space: Dict[str, Space],
+    objective: ScoreFn,
+    budget: int,
+    rng: Optional[np.random.Generator] = None,
+    stop_when: Stopper = None,
+    *,
+    eta: int = 3,
+    min_resource: int = 1,
+    max_resource: int = 9,
+) -> List[Trial]:
+    """Hyperband: several Successive Halving brackets on a shared eval budget.
+
+    Follows Li et al. (2018): ``s_max = floor(log_eta(R / r_min))`` brackets
+    with different ``(n, r)`` allocations, from many cheap evaluations to a
+    few full-fidelity ones. Rounds repeat until ``budget`` evaluations are
+    used, so the strategy is comparable to random / grid / GP on the same
+    number of objective calls.
+
+    Fidelity is a normalized ``resource`` in ``(0, 1]``; see
+    :func:`successive_halving`.
+    """
+    _validate_space(space)
+    if budget < 1:
+        raise ValueError("budget must be >= 1")
+    _validate_hyperband_params(eta, min_resource, max_resource)
+    rng = rng if rng is not None else np.random.default_rng()
+
+    brackets = hyperband_brackets(max_resource, eta, min_resource)
+    evaluate = _resource_caller(objective)
+    trials: List[Trial] = []
+    while len(trials) < budget:
+        progressed = False
+        for s, n, r in brackets:
+            remaining = budget - len(trials)
+            if remaining <= 0:
+                break
+            n_use = min(int(n), remaining)
+            before = len(trials)
+            stopped = _run_sh_bracket(
+                space=space,
+                evaluate=evaluate,
+                rng=rng,
+                n=n_use,
+                r=r,
+                s=s,
+                eta=eta,
+                max_resource=max_resource,
+                trials=trials,
+                budget=budget,
+                stop_when=stop_when,
+            )
+            if len(trials) > before:
+                progressed = True
+            if stopped:
+                return trials
+        if not progressed:
+            while len(trials) < budget:
+                params = _sample_config(space, rng)
+                score = float(evaluate(params, 1.0))
+                trials.append(Trial(len(trials), params, score, resource=1.0))
+                if stop_when is not None and stop_when(_best_score(trials), len(trials)):
+                    return trials
+            break
     return trials

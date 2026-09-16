@@ -8,7 +8,7 @@ import json
 import sys
 from typing import List, Optional
 
-from .evaluate import compare_strategies, run_search
+from .evaluate import available_strategies, compare_strategies, run_search
 from .objectives import demo_objective
 from .report import render_report, write_report
 from .spaces import parse_space
@@ -46,12 +46,34 @@ def _positive_int(value: str) -> int:
     return n
 
 
+def _eta(value: str) -> int:
+    n = int(value)
+    if n < 2:
+        raise argparse.ArgumentTypeError("eta must be an integer >= 2")
+    return n
+
+
+def _hyperband_kwargs(args) -> dict:
+    kwargs = {
+        "eta": args.eta,
+        "min_resource": args.min_resource,
+        "max_resource": args.max_resource,
+    }
+    if getattr(args, "n_candidates", None) is not None:
+        kwargs["n_candidates"] = args.n_candidates
+    return kwargs
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="hyperopt-kit",
-        description="Hyperparameter optimization toolkit: grid, random and bayesian search.",
+        description=(
+            "Hyperparameter optimization toolkit: grid, random, bayesian "
+            "and Hyperband / successive-halving search."
+        ),
     )
     sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
+    strategy_names = available_strategies()
 
     def add_common(p: argparse.ArgumentParser) -> None:
         p.add_argument(
@@ -66,14 +88,26 @@ def build_parser() -> argparse.ArgumentParser:
         )
         p.add_argument("--seed", type=int, default=None, help="seed for reproducibility")
         p.add_argument(
-            "--strategies", default="grid,random,bayesian",
+            "--strategies", default="grid,random,bayesian,hyperband",
             help="comma-separated strategies to run",
+        )
+        p.add_argument(
+            "--eta", type=_eta, default=3,
+            help="Hyperband / successive-halving downsampling rate (integer >= 2)",
+        )
+        p.add_argument(
+            "--min-resource", type=_positive_int, default=1,
+            help="minimum resource units for multi-fidelity search",
+        )
+        p.add_argument(
+            "--max-resource", type=_positive_int, default=9,
+            help="maximum resource units (full fidelity) for multi-fidelity search",
         )
 
     p_search = sub.add_parser("search", help="run a single search strategy")
     add_common(p_search)
     p_search.add_argument(
-        "--strategy", default="bayesian", choices=["grid", "random", "bayesian"]
+        "--strategy", default="bayesian", choices=strategy_names
     )
     p_search.add_argument(
         "--xi", type=float, default=0.01,
@@ -82,6 +116,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_search.add_argument(
         "--n-initial", type=int, default=None,
         help="number of random points before the surrogate kicks in",
+    )
+    p_search.add_argument(
+        "--n-candidates", type=_positive_int, default=None,
+        help="starting configurations for successive_halving (default: Hyperband formula)",
     )
     p_search.add_argument(
         "--floor", type=float, default=None, help="stop when the best score reaches this"
@@ -113,7 +151,26 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not strategies:
         parser.error("--strategies must not be empty")
 
+    mf_kwargs = _hyperband_kwargs(args)
+    strategy_kwargs = {
+        "hyperband": {
+            "eta": mf_kwargs["eta"],
+            "min_resource": mf_kwargs["min_resource"],
+            "max_resource": mf_kwargs["max_resource"],
+        },
+        "successive_halving": dict(mf_kwargs),
+    }
+
     if args.command == "search":
+        extra = {
+            "xi": args.xi,
+            "n_initial": args.n_initial,
+            "eta": mf_kwargs["eta"],
+            "min_resource": mf_kwargs["min_resource"],
+            "max_resource": mf_kwargs["max_resource"],
+        }
+        if args.strategy == "successive_halving" and args.n_candidates is not None:
+            extra["n_candidates"] = args.n_candidates
         result = run_search(
             args.strategy,
             space,
@@ -122,8 +179,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             seed=args.seed,
             floor=args.floor,
             patience=args.patience,
-            xi=args.xi,
-            n_initial=args.n_initial,
+            **extra,
         )
         print(f"strategy: {result.strategy}")
         print(f"trials: {len(result.trials)}")
@@ -136,7 +192,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.command == "compare":
         results = compare_strategies(
-            space, objective, args.budget, strategies=strategies, seed=args.seed
+            space,
+            objective,
+            args.budget,
+            strategies=strategies,
+            seed=args.seed,
+            strategy_kwargs=strategy_kwargs,
         )
         print("| strategy | trials | best score |")
         print("| --- | ---: | ---: |")
@@ -146,7 +207,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.command == "report":
         results = compare_strategies(
-            space, objective, args.budget, strategies=strategies, seed=args.seed
+            space,
+            objective,
+            args.budget,
+            strategies=strategies,
+            seed=args.seed,
+            strategy_kwargs=strategy_kwargs,
         )
         text = render_report(
             results,
