@@ -3,6 +3,8 @@
 ``grid_search`` and ``random_search`` are self-explanatory baselines;
 ``bayesian_search`` fits a squared-exponential Gaussian-process surrogate
 and picks the next configuration by maximizing expected improvement;
+``tpe_search`` models good vs bad observations with Parzen estimators and
+picks the candidate that maximizes the ``l(x)/g(x)`` density ratio;
 ``hyperband_search`` / ``successive_halving`` run multi-fidelity brackets
 that spend cheap evaluations to discard poor configurations early.
 """
@@ -326,6 +328,374 @@ def bayesian_search(
             X = np.vstack([X, candidates[idx][None, :]])
             y = np.append(y, score)
             gp.fit(X, y)
+    return trials
+
+
+def _logsumexp(a: np.ndarray, axis: int = -1) -> np.ndarray:
+    """Numerically stable log-sum-exp along ``axis``."""
+    a = np.asarray(a, dtype=float)
+    keep = np.max(a, axis=axis, keepdims=True)
+    safe = np.where(np.isfinite(keep), keep, 0.0)
+    summed = np.log(np.maximum(np.sum(np.exp(a - safe), axis=axis, keepdims=True), 0.0))
+    out = np.squeeze(summed + keep, axis=axis)
+    finite = np.isfinite(np.squeeze(keep, axis=axis))
+    return np.where(finite, out, -np.inf)
+
+
+def tpe_split(scores, gamma: float = 0.25) -> Tuple[np.ndarray, np.ndarray]:
+    """Split observation indices into below-threshold (good) and above (bad).
+
+    ``gamma`` is the TPE quantile: roughly that fraction of the lowest scores
+    form ``l(x)``. At least one observation is kept on each side whenever
+    ``len(scores) >= 2``.
+    """
+    scores = np.asarray(scores, dtype=float)
+    if scores.ndim != 1 or scores.size == 0:
+        raise ValueError("scores must be a non-empty 1-d array")
+    if not (0.0 < float(gamma) < 1.0):
+        raise ValueError("gamma must be in (0, 1)")
+    n = int(scores.size)
+    if n == 1:
+        return np.array([0], dtype=int), np.array([], dtype=int)
+    n_below = int(np.floor(float(gamma) * n))
+    n_below = min(max(n_below, 1), n - 1)
+    order = np.argsort(scores, kind="mergesort")
+    return order[:n_below].astype(int), order[n_below:].astype(int)
+
+
+def adaptive_parzen(
+    observations: np.ndarray,
+    *,
+    prior_mu: float = 0.5,
+    prior_sigma: float = 1.0,
+    prior_weight: float = 1.0,
+    bandwidth_factor: float = 1.0,
+    low: float = 0.0,
+    high: float = 1.0,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """1-d adaptive Parzen estimator (Bergstra et al., 2011).
+
+    Returns ``(weights, means, stds)`` of a Gaussian mixture. Each observation
+    is a kernel whose bandwidth is the greater of the distances to its sorted
+    neighbours, mixed with a prior component so empty regions still have mass.
+    """
+    xs = np.asarray(observations, dtype=float).reshape(-1)
+    if prior_weight <= 0.0:
+        raise ValueError("prior_weight must be > 0")
+    if bandwidth_factor <= 0.0:
+        raise ValueError("bandwidth_factor must be > 0")
+    span = max(float(high) - float(low), 1e-12)
+    prior_sigma = max(float(prior_sigma), 1e-12)
+
+    if xs.size == 0:
+        return (
+            np.array([1.0], dtype=float),
+            np.array([float(prior_mu)], dtype=float),
+            np.array([prior_sigma], dtype=float),
+        )
+
+    order = np.argsort(xs)
+    sorted_xs = xs[order]
+    sorted_sigma = np.empty(xs.size, dtype=float)
+    if xs.size == 1:
+        sorted_sigma[0] = prior_sigma
+    else:
+        sorted_sigma[0] = sorted_xs[1] - sorted_xs[0]
+        sorted_sigma[-1] = sorted_xs[-1] - sorted_xs[-2]
+        if xs.size > 2:
+            left = sorted_xs[1:-1] - sorted_xs[:-2]
+            right = sorted_xs[2:] - sorted_xs[1:-1]
+            sorted_sigma[1:-1] = np.maximum(left, right)
+    sigma = np.empty(xs.size, dtype=float)
+    sigma[order] = sorted_sigma * float(bandwidth_factor)
+    minsigma = span / max(100.0, 1.0 + float(xs.size))
+    sigma = np.clip(sigma, minsigma, span)
+
+    weights = np.ones(xs.size + 1, dtype=float)
+    weights[-1] = float(prior_weight)
+    weights /= weights.sum()
+    means = np.append(xs, float(prior_mu))
+    stds = np.append(sigma, prior_sigma)
+    return weights, means, stds
+
+
+def categorical_probs(
+    space: Categorical, values, prior_weight: float = 1.0
+) -> np.ndarray:
+    """Dirichlet-smoothed categorical probabilities over ``space.choices``."""
+    if prior_weight <= 0.0:
+        raise ValueError("prior_weight must be > 0")
+    counts = np.zeros(len(space.choices), dtype=float)
+    for value in values:
+        counts[space.choices.index(value)] += 1.0
+    probs = counts + float(prior_weight)
+    return probs / probs.sum()
+
+
+def gmm_logpdf(
+    x: np.ndarray,
+    weights: np.ndarray,
+    means: np.ndarray,
+    stds: np.ndarray,
+    low: float = 0.0,
+    high: float = 1.0,
+) -> np.ndarray:
+    """Log-density of a truncated 1-d Gaussian mixture on ``[low, high]``."""
+    x = np.asarray(x, dtype=float).reshape(-1)
+    weights = np.asarray(weights, dtype=float)
+    means = np.asarray(means, dtype=float)
+    stds = np.maximum(np.asarray(stds, dtype=float), 1e-12)
+    z = (x[:, None] - means[None, :]) / stds[None, :]
+    log_normal = np.log(np.maximum(_norm_pdf(z) / stds[None, :], 1e-300))
+    mass = _norm_cdf((high - means) / stds) - _norm_cdf((low - means) / stds)
+    mass = np.maximum(mass, 1e-12)
+    log_comp = np.log(np.maximum(weights, 1e-300)) + log_normal - np.log(mass)
+    out = _logsumexp(log_comp, axis=1)
+    return np.where((x < low) | (x > high), -np.inf, out)
+
+
+def _truncated_normal(
+    rng: np.random.Generator,
+    mu: float,
+    sigma: float,
+    low: float,
+    high: float,
+    size: int,
+) -> np.ndarray:
+    sigma = max(float(sigma), 1e-12)
+    collected: List[np.ndarray] = []
+    remaining = int(size)
+    for _ in range(32):
+        draw = rng.normal(mu, sigma, size=max(remaining * 4, 8))
+        accepted = draw[(draw >= low) & (draw <= high)]
+        if accepted.size:
+            take = min(remaining, int(accepted.size))
+            collected.append(accepted[:take])
+            remaining -= take
+        if remaining <= 0:
+            return np.concatenate(collected)[:size]
+    collected.append(np.clip(rng.normal(mu, sigma, size=remaining), low, high))
+    return np.concatenate(collected)[:size]
+
+
+def gmm_sample(
+    rng: np.random.Generator,
+    n: int,
+    weights: np.ndarray,
+    means: np.ndarray,
+    stds: np.ndarray,
+    low: float = 0.0,
+    high: float = 1.0,
+) -> np.ndarray:
+    """Draw ``n`` samples from a truncated 1-d Gaussian mixture."""
+    weights = np.asarray(weights, dtype=float)
+    weights = weights / weights.sum()
+    means = np.asarray(means, dtype=float)
+    stds = np.asarray(stds, dtype=float)
+    comps = rng.choice(len(weights), size=n, p=weights)
+    out = np.empty(n, dtype=float)
+    for k in range(len(weights)):
+        idx = np.flatnonzero(comps == k)
+        if idx.size == 0:
+            continue
+        out[idx] = _truncated_normal(rng, float(means[k]), float(stds[k]), low, high, idx.size)
+    return np.clip(out, low, high)
+
+
+def _fit_parzen(
+    sp: Space, values: List[Any], prior_weight: float, bandwidth_factor: float
+):
+    if isinstance(sp, Categorical):
+        return ("cat", categorical_probs(sp, values, prior_weight))
+    xs = np.array([sp.normalize(v) for v in values], dtype=float)
+    weights, means, stds = adaptive_parzen(
+        xs, prior_weight=prior_weight, bandwidth_factor=bandwidth_factor
+    )
+    return ("gmm", weights, means, stds)
+
+
+def _sample_from_parzen(sp: Space, model, rng: np.random.Generator, n: int):
+    kind = model[0]
+    if kind == "cat":
+        probs = model[1]
+        idx = rng.choice(len(sp.choices), size=n, p=probs)
+        values = [sp.choices[int(i)] for i in idx]
+        logp = np.log(np.maximum(probs[idx], 1e-300))
+        return values, logp
+    weights, means, stds = model[1], model[2], model[3]
+    xs = gmm_sample(rng, n, weights, means, stds)
+    logp = gmm_logpdf(xs, weights, means, stds)
+    return [sp.denormalize(float(x)) for x in xs], logp
+
+
+def _parzen_logpdf(sp: Space, model, values: List[Any]) -> np.ndarray:
+    kind = model[0]
+    if kind == "cat":
+        probs = model[1]
+        idx = np.array([sp.choices.index(v) for v in values], dtype=int)
+        return np.log(np.maximum(probs[idx], 1e-300))
+    weights, means, stds = model[1], model[2], model[3]
+    xs = np.array([sp.normalize(v) for v in values], dtype=float)
+    return gmm_logpdf(xs, weights, means, stds)
+
+
+def _fit_tpe_models(
+    space: Dict[str, Space],
+    names: List[str],
+    below: List[Trial],
+    above: List[Trial],
+    prior_weight: float,
+    bandwidth_factor: float,
+):
+    models_l = {}
+    models_g = {}
+    for name in names:
+        sp = space[name]
+        models_l[name] = _fit_parzen(
+            sp, [t.params[name] for t in below], prior_weight, bandwidth_factor
+        )
+        models_g[name] = _fit_parzen(
+            sp, [t.params[name] for t in above], prior_weight, bandwidth_factor
+        )
+    return models_l, models_g
+
+
+def tpe_log_density_ratio(
+    params: Dict[str, Any],
+    space: Dict[str, Space],
+    trials: List[Trial],
+    *,
+    gamma: float = 0.25,
+    prior_weight: float = 1.0,
+    bandwidth_factor: float = 1.0,
+) -> float:
+    """``log l(x) - log g(x)`` for ``params`` given observed ``trials``.
+
+    ``l`` is the Parzen density of observations below the ``gamma`` quantile
+    of scores; ``g`` is the density of the rest. TPE maximizes this ratio
+    (equivalently expected improvement under the TPE model).
+    """
+    _validate_space(space)
+    if len(trials) < 2:
+        raise ValueError("tpe_log_density_ratio needs at least two trials")
+    names = list(space)
+    below_idx, above_idx = tpe_split([t.score for t in trials], gamma=gamma)
+    below = [trials[int(i)] for i in below_idx]
+    above = [trials[int(i)] for i in above_idx]
+    models_l, models_g = _fit_tpe_models(
+        space, names, below, above, prior_weight, bandwidth_factor
+    )
+    log_ratio = 0.0
+    for name in names:
+        log_ratio += float(
+            _parzen_logpdf(space[name], models_l[name], [params[name]])[0]
+            - _parzen_logpdf(space[name], models_g[name], [params[name]])[0]
+        )
+    return log_ratio
+
+
+def _propose_tpe(
+    space: Dict[str, Space],
+    names: List[str],
+    below: List[Trial],
+    above: List[Trial],
+    rng: np.random.Generator,
+    n_candidates: int,
+    prior_weight: float,
+    bandwidth_factor: float,
+) -> Dict[str, Any]:
+    models_l, models_g = _fit_tpe_models(
+        space, names, below, above, prior_weight, bandwidth_factor
+    )
+    samples: Dict[str, List[Any]] = {}
+    log_ratio = np.zeros(n_candidates, dtype=float)
+    for name in names:
+        sp = space[name]
+        sampled, log_l = _sample_from_parzen(sp, models_l[name], rng, n_candidates)
+        log_g = _parzen_logpdf(sp, models_g[name], sampled)
+        samples[name] = sampled
+        log_ratio += log_l - log_g
+    idx = int(np.argmax(log_ratio))
+    if not np.isfinite(log_ratio[idx]):
+        idx = int(rng.integers(0, n_candidates))
+    return {name: samples[name][idx] for name in names}
+
+
+def tpe_search(
+    space: Dict[str, Space],
+    objective: ScoreFn,
+    budget: int,
+    rng: Optional[np.random.Generator] = None,
+    stop_when: Stopper = None,
+    *,
+    gamma: float = 0.25,
+    n_initial: Optional[int] = None,
+    n_candidates: int = 24,
+    prior_weight: float = 1.0,
+    bandwidth_factor: float = 1.0,
+) -> List[Trial]:
+    """Tree-structured Parzen Estimator search (Bergstra et al., 2011).
+
+    After ``n_initial`` random evaluations, observations are split by the
+    ``gamma`` quantile of scores. Independent Parzen estimators ``l(x)``
+    (below-threshold / good) and ``g(x)`` (above / bad) are fit on each
+    parameter using :meth:`Space.normalize` / :meth:`Space.denormalize`.
+    Candidates are drawn from ``l`` and the one maximizing ``l(x)/g(x)``
+    is evaluated. Expected improvement under this model is a monotone
+    function of that density ratio.
+    """
+    _validate_space(space)
+    if budget < 1:
+        raise ValueError("budget must be >= 1")
+    if not (0.0 < float(gamma) < 1.0):
+        raise ValueError("gamma must be in (0, 1)")
+    if int(n_candidates) != n_candidates or n_candidates < 1:
+        raise ValueError("n_candidates must be an integer >= 1")
+    if prior_weight <= 0.0:
+        raise ValueError("prior_weight must be > 0")
+    if bandwidth_factor <= 0.0:
+        raise ValueError("bandwidth_factor must be > 0")
+    rng = rng if rng is not None else np.random.default_rng()
+    names = list(space)
+    dims = len(names)
+
+    if n_initial is None:
+        n_initial = max(5, dims + 1)
+    n_initial = max(1, int(n_initial))
+    n_initial = min(n_initial, budget)
+
+    trials: List[Trial] = []
+    best = float("inf")
+    for i in range(n_initial):
+        params = _sample_config(space, rng)
+        score = float(objective(params))
+        trials.append(Trial(i, params, score))
+        best = min(best, score)
+        if stop_when is not None and stop_when(best, len(trials)):
+            return trials
+
+    while len(trials) < budget:
+        if len(trials) < 2:
+            params = _sample_config(space, rng)
+        else:
+            below_idx, above_idx = tpe_split([t.score for t in trials], gamma=gamma)
+            below = [trials[int(i)] for i in below_idx]
+            above = [trials[int(i)] for i in above_idx]
+            params = _propose_tpe(
+                space,
+                names,
+                below,
+                above,
+                rng,
+                int(n_candidates),
+                prior_weight,
+                bandwidth_factor,
+            )
+        score = float(objective(params))
+        trials.append(Trial(len(trials), params, score))
+        best = min(best, score)
+        if stop_when is not None and stop_when(best, len(trials)):
+            break
     return trials
 
 

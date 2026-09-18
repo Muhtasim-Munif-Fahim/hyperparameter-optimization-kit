@@ -183,6 +183,11 @@ def render_report(
         "equal steps in normalized space are multiplicative on the raw scale."
     )
     lines.append(
+        "- TPE factorizes a Parzen density per parameter and maximizes "
+        "l(x)/g(x); it handles categoricals naturally but ignores "
+        "interactions that a joint (multivariate) model would capture."
+    )
+    lines.append(
         "- Hyperband / successive-halving evaluate the same configuration at "
         "increasing fidelities; reported best scores use the highest-resource "
         "rung so a lucky cheap evaluation cannot win the comparison."

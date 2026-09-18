@@ -5,6 +5,7 @@ from .report import render_report, write_report
 from .searchers import (
     GaussianProcess,
     Trial,
+    adaptive_parzen,
     bayesian_search,
     expected_improvement,
     grid_search,
@@ -12,6 +13,9 @@ from .searchers import (
     hyperband_search,
     random_search,
     successive_halving,
+    tpe_log_density_ratio,
+    tpe_search,
+    tpe_split,
 )
 from .spaces import Categorical, FloatRange, IntRange, Space, parse_space
 
@@ -25,6 +29,7 @@ __all__ = [
     "RunResult",
     "Space",
     "Trial",
+    "adaptive_parzen",
     "available_strategies",
     "bayesian_search",
     "compare_strategies",
@@ -37,5 +42,8 @@ __all__ = [
     "render_report",
     "run_search",
     "successive_halving",
+    "tpe_log_density_ratio",
+    "tpe_search",
+    "tpe_split",
     "write_report",
 ]

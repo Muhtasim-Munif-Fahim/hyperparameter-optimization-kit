@@ -68,8 +68,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="hyperopt-kit",
         description=(
-            "Hyperparameter optimization toolkit: grid, random, bayesian "
-            "and Hyperband / successive-halving search."
+            "Hyperparameter optimization toolkit: grid, random, bayesian, "
+            "TPE and Hyperband / successive-halving search."
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
@@ -88,8 +88,12 @@ def build_parser() -> argparse.ArgumentParser:
         )
         p.add_argument("--seed", type=int, default=None, help="seed for reproducibility")
         p.add_argument(
-            "--strategies", default="grid,random,bayesian,hyperband",
+            "--strategies", default="grid,random,bayesian,tpe,hyperband",
             help="comma-separated strategies to run",
+        )
+        p.add_argument(
+            "--gamma", type=float, default=0.25,
+            help="TPE quantile: fraction of observations modeled by l(x)",
         )
         p.add_argument(
             "--eta", type=_eta, default=3,
@@ -119,7 +123,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_search.add_argument(
         "--n-candidates", type=_positive_int, default=None,
-        help="starting configurations for successive_halving (default: Hyperband formula)",
+        help="TPE / bayesian candidate pool, or successive_halving starting configs",
     )
     p_search.add_argument(
         "--floor", type=float, default=None, help="stop when the best score reaches this"
@@ -159,17 +163,19 @@ def main(argv: Optional[List[str]] = None) -> int:
             "max_resource": mf_kwargs["max_resource"],
         },
         "successive_halving": dict(mf_kwargs),
+        "tpe": {"gamma": args.gamma},
     }
 
     if args.command == "search":
         extra = {
             "xi": args.xi,
             "n_initial": args.n_initial,
+            "gamma": args.gamma,
             "eta": mf_kwargs["eta"],
             "min_resource": mf_kwargs["min_resource"],
             "max_resource": mf_kwargs["max_resource"],
         }
-        if args.strategy == "successive_halving" and args.n_candidates is not None:
+        if args.n_candidates is not None:
             extra["n_candidates"] = args.n_candidates
         result = run_search(
             args.strategy,
