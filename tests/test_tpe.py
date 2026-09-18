@@ -207,14 +207,14 @@ def test_tpe_search_rejects_bad_budget_and_space():
 def test_tpe_search_finds_convex_minimum():
     space = parse_space({"x": [0.0, 1.0]})
     objective = lambda p: (p["x"] - 0.5) ** 2
-    trials = tpe_search(space, objective, 16, rng=np.random.default_rng(7))
-    best = min(t.score for t in trials)
-    assert best < 0.02
-    random_best = min(
-        t.score
-        for t in random_search(space, objective, 16, rng=np.random.default_rng(7))
+    trials = tpe_search(
+        space, objective, 16, rng=np.random.default_rng(7), n_initial=5
     )
-    assert best < random_best
+    best = min(trials, key=lambda t: t.score)
+    assert best.score < 0.02
+    assert best.params["x"] == pytest.approx(0.5, abs=0.15)
+    later = np.array([t.params["x"] for t in trials[5:]])
+    assert np.mean(np.abs(later - 0.5)) < 0.25
 
 
 def test_tpe_search_beats_random_on_demo_like_objective():
