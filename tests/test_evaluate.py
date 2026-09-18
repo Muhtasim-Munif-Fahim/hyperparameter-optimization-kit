@@ -52,9 +52,23 @@ def test_run_search_hyperband_returns_runresult():
     assert all(t.resource is not None for t in result.trials)
 
 
-def test_available_strategies_lists_hyperband():
+def test_run_search_tpe_returns_runresult():
+    result = run_search("tpe", _space(), _objective, budget=15, seed=3)
+    assert result.strategy == "tpe"
+    assert len(result.trials) == 15
+    assert result.best_params["x"] == pytest.approx(0.5, abs=0.25)
+
+
+def test_available_strategies_lists_tpe_and_hyperband():
     names = available_strategies()
-    assert names == ["grid", "random", "bayesian", "hyperband", "successive_halving"]
+    assert names == [
+        "grid",
+        "random",
+        "bayesian",
+        "tpe",
+        "hyperband",
+        "successive_halving",
+    ]
 
 
 def test_run_search_unknown_strategy_raises():
@@ -159,9 +173,10 @@ def test_learning_curve_is_monotone_non_increasing():
 
 def test_compare_strategies_common_budget():
     results = compare_strategies(_space(), _objective, budget=20, seed=7)
-    assert set(results) == {"grid", "random", "bayesian", "hyperband"}
+    assert set(results) == {"grid", "random", "bayesian", "tpe", "hyperband"}
     assert len(results["random"].trials) == 20
     assert len(results["bayesian"].trials) == 20
+    assert len(results["tpe"].trials) == 20
     assert len(results["hyperband"].trials) == 20
     assert len(results["grid"].trials) <= 20
 
@@ -195,7 +210,7 @@ def test_compare_strategies_per_strategy_kwargs():
         seed=7,
         strategy_kwargs={"bayesian": {"xi": 0.5}},
     )
-    assert set(results) == {"grid", "random", "bayesian", "hyperband"}
+    assert set(results) == {"grid", "random", "bayesian", "tpe", "hyperband"}
 
 
 def test_compare_strategies_subset():

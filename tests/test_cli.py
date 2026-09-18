@@ -84,6 +84,7 @@ def test_compare_subcommand_prints_table(capsys):
     assert "| grid |" in out
     assert "| random |" in out
     assert "| bayesian |" in out
+    assert "| tpe |" in out
     assert "| hyperband |" in out
 
 
@@ -108,6 +109,39 @@ def test_search_successive_halving_subcommand(capsys):
     assert rc == 0
     assert "strategy: successive_halving" in out
     assert "trials: 10" in out
+
+
+def test_search_tpe_subcommand(capsys):
+    rc = main(
+        ["search", "--space", SPACE, "--objective", "demo", "--budget", "10",
+         "--strategy", "tpe", "--seed", "2"]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "strategy: tpe" in out
+    assert "trials: 10" in out
+
+
+def test_search_tpe_gamma_accepted(capsys):
+    rc = main(
+        ["search", "--space", SPACE, "--objective", "demo", "--budget", "10",
+         "--strategy", "tpe", "--seed", "2", "--gamma", "0.15", "--n-candidates", "12"]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "strategy: tpe" in out
+
+
+def test_compare_with_tpe_only(capsys):
+    rc = main(
+        ["compare", "--space", SPACE, "--objective", "demo", "--budget", "8",
+         "--seed", "3", "--strategies", "random,tpe"]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "| random |" in out
+    assert "| tpe |" in out
+    assert "| grid |" not in out
 
 
 def test_compare_with_hyperband_only(capsys):
