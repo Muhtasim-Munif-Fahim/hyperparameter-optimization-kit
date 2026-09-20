@@ -286,7 +286,7 @@ def test_run_search_forwarded_tpe_kwargs():
 
 def test_compare_strategies_includes_tpe():
     results = compare_strategies(_space(), _obj, budget=10, seed=7)
-    assert set(results) >= {"grid", "random", "bayesian", "tpe", "hyperband"}
+    assert set(results) >= {"grid", "random", "bayesian", "tpe", "cmaes", "hyperband"}
     assert len(results["tpe"].trials) == 10
 
 

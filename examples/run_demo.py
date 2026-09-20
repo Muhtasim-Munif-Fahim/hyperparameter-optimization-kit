@@ -1,4 +1,4 @@
-"""Demo: compare grid, random, bayesian, TPE and Hyperband search on a noisy toy.
+"""Demo: compare grid, random, bayesian, TPE, CMA-ES and Hyperband search on a noisy toy.
 
 The demo objective has a known minimum of 0 at (a, b) = (1, 2) plus gaussian
 noise, so you can eyeball how close each strategy gets on the same budget.

@@ -188,6 +188,11 @@ def render_report(
         "interactions that a joint (multivariate) model would capture."
     )
     lines.append(
+        "- CMA-ES adapts a multivariate Gaussian on the normalized unit cube "
+        "(mean, step-size and covariance). It is meant for FloatRange / "
+        "IntRange spaces; categorical parameters are treated as ordered."
+    )
+    lines.append(
         "- Hyperband / successive-halving evaluate the same configuration at "
         "increasing fidelities; reported best scores use the highest-resource "
         "rung so a lucky cheap evaluation cannot win the comparison."

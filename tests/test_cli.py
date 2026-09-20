@@ -85,6 +85,7 @@ def test_compare_subcommand_prints_table(capsys):
     assert "| random |" in out
     assert "| bayesian |" in out
     assert "| tpe |" in out
+    assert "| cmaes |" in out
     assert "| hyperband |" in out
 
 
@@ -120,6 +121,40 @@ def test_search_tpe_subcommand(capsys):
     assert rc == 0
     assert "strategy: tpe" in out
     assert "trials: 10" in out
+
+
+def test_search_cmaes_subcommand(capsys):
+    rc = main(
+        ["search", "--space", SPACE, "--objective", "demo", "--budget", "10",
+         "--strategy", "cmaes", "--seed", "2"]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "strategy: cmaes" in out
+    assert "trials: 10" in out
+
+
+def test_search_cmaes_sigma0_accepted(capsys):
+    rc = main(
+        ["search", "--space", SPACE, "--objective", "demo", "--budget", "10",
+         "--strategy", "cmaes", "--seed", "2", "--sigma0", "0.2",
+         "--population-size", "6"]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "strategy: cmaes" in out
+
+
+def test_compare_with_cmaes_only(capsys):
+    rc = main(
+        ["compare", "--space", SPACE, "--objective", "demo", "--budget", "8",
+         "--seed", "3", "--strategies", "random,cmaes"]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "| random |" in out
+    assert "| cmaes |" in out
+    assert "| grid |" not in out
 
 
 def test_search_tpe_gamma_accepted(capsys):
