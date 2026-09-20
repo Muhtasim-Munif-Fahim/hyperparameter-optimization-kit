@@ -53,6 +53,13 @@ def _eta(value: str) -> int:
     return n
 
 
+def _population_size(value: str) -> int:
+    n = int(value)
+    if n < 2:
+        raise argparse.ArgumentTypeError("population-size must be an integer >= 2")
+    return n
+
+
 def _hyperband_kwargs(args) -> dict:
     kwargs = {
         "eta": args.eta,
@@ -69,7 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="hyperopt-kit",
         description=(
             "Hyperparameter optimization toolkit: grid, random, bayesian, "
-            "TPE and Hyperband / successive-halving search."
+            "TPE, CMA-ES and Hyperband / successive-halving search."
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
@@ -88,12 +95,20 @@ def build_parser() -> argparse.ArgumentParser:
         )
         p.add_argument("--seed", type=int, default=None, help="seed for reproducibility")
         p.add_argument(
-            "--strategies", default="grid,random,bayesian,tpe,hyperband",
+            "--strategies", default="grid,random,bayesian,tpe,cmaes,hyperband",
             help="comma-separated strategies to run",
         )
         p.add_argument(
             "--gamma", type=float, default=0.25,
             help="TPE quantile: fraction of observations modeled by l(x)",
+        )
+        p.add_argument(
+            "--population-size", type=_population_size, default=None,
+            help="CMA-ES offspring per generation (default: 4 + floor(3 log n))",
+        )
+        p.add_argument(
+            "--sigma0", type=float, default=0.3,
+            help="CMA-ES initial step-size on the unit cube",
         )
         p.add_argument(
             "--eta", type=_eta, default=3,
@@ -164,17 +179,23 @@ def main(argv: Optional[List[str]] = None) -> int:
         },
         "successive_halving": dict(mf_kwargs),
         "tpe": {"gamma": args.gamma},
+        "cmaes": {"sigma0": args.sigma0},
     }
+    if args.population_size is not None:
+        strategy_kwargs["cmaes"]["population_size"] = args.population_size
 
     if args.command == "search":
         extra = {
             "xi": args.xi,
             "n_initial": args.n_initial,
             "gamma": args.gamma,
+            "sigma0": args.sigma0,
             "eta": mf_kwargs["eta"],
             "min_resource": mf_kwargs["min_resource"],
             "max_resource": mf_kwargs["max_resource"],
         }
+        if args.population_size is not None:
+            extra["population_size"] = args.population_size
         if args.n_candidates is not None:
             extra["n_candidates"] = args.n_candidates
         result = run_search(

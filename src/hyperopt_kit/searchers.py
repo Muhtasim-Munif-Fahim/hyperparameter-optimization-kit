@@ -5,6 +5,9 @@
 and picks the next configuration by maximizing expected improvement;
 ``tpe_search`` models good vs bad observations with Parzen estimators and
 picks the candidate that maximizes the ``l(x)/g(x)`` density ratio;
+``cmaes_search`` maintains a multivariate Gaussian in normalized
+FloatRange / IntRange space and adapts its mean, step-size and covariance
+from ranked offspring (Hansen CMA-ES);
 ``hyperband_search`` / ``successive_halving`` run multi-fidelity brackets
 that spend cheap evaluations to discard poor configurations early.
 """
@@ -934,4 +937,228 @@ def hyperband_search(
                 if stop_when is not None and stop_when(_best_score(trials), len(trials)):
                     return trials
             break
+    return trials
+
+
+def _chi_expectation(n: int) -> float:
+    """Approximate ``E[||N(0, I_n)||]`` used by CMA-ES step-size control."""
+    n = max(int(n), 1)
+    return math.sqrt(n) * (1.0 - 1.0 / (4.0 * n) + 1.0 / (21.0 * n * n))
+
+
+def cmaes_weights(n_parents: int) -> np.ndarray:
+    """Positive recombination weights ``w_i ∝ log(μ + 1/2) - log(i)``.
+
+    Hansen's default: the ``μ`` best offspring get logarithmically decaying
+    weights that sum to one. ``μ_eff = 1 / Σ w_i²`` follows from these.
+    """
+    if int(n_parents) != n_parents or n_parents < 1:
+        raise ValueError("n_parents must be an integer >= 1")
+    ranks = np.arange(1, int(n_parents) + 1, dtype=float)
+    weights = np.log(n_parents + 0.5) - np.log(ranks)
+    weights = np.maximum(weights, 0.0)
+    total = float(weights.sum())
+    if total <= 0.0:
+        return np.ones(int(n_parents), dtype=float) / float(n_parents)
+    return weights / total
+
+
+@dataclass
+class CMAESParameters:
+    """Hansen default population size, weights and learning rates."""
+
+    population_size: int
+    n_parents: int
+    weights: np.ndarray
+    mu_eff: float
+    c_sigma: float
+    d_sigma: float
+    c_c: float
+    c_1: float
+    c_mu: float
+
+
+def cmaes_parameters(
+    dimension: int, population_size: Optional[int] = None
+) -> CMAESParameters:
+    """Recommended CMA-ES constants for a ``dimension``-d search.
+
+    ``population_size`` defaults to ``4 + floor(3 log n)``. Learning rates
+    follow Hansen's tutorial so rank-1 / rank-μ covariance updates and
+    cumulative step-size adaptation stay stable on the small continuous
+    spaces typical of hyperparameter search.
+    """
+    if int(dimension) != dimension or dimension < 1:
+        raise ValueError("dimension must be an integer >= 1")
+    n = int(dimension)
+    if population_size is None:
+        lam = 4 + int(math.floor(3.0 * math.log(n)))
+    else:
+        if int(population_size) != population_size or population_size < 2:
+            raise ValueError("population_size must be an integer >= 2")
+        lam = int(population_size)
+    lam = max(2, lam)
+    mu = max(1, lam // 2)
+    weights = cmaes_weights(mu)
+    mu_eff = float(1.0 / np.sum(weights * weights))
+    c_sigma = (mu_eff + 2.0) / (n + mu_eff + 5.0)
+    d_sigma = (
+        1.0
+        + 2.0 * max(0.0, math.sqrt((mu_eff - 1.0) / (n + 1.0)) - 1.0)
+        + c_sigma
+    )
+    c_c = (4.0 + mu_eff / n) / (n + 4.0 + 2.0 * mu_eff / n)
+    c_1 = 2.0 / ((n + 1.3) ** 2 + mu_eff)
+    c_mu = min(
+        1.0 - c_1,
+        2.0 * (mu_eff - 2.0 + 1.0 / mu_eff) / ((n + 2.0) ** 2 + mu_eff),
+    )
+    c_mu = max(float(c_mu), 0.0)
+    return CMAESParameters(
+        population_size=lam,
+        n_parents=mu,
+        weights=weights,
+        mu_eff=mu_eff,
+        c_sigma=float(c_sigma),
+        d_sigma=float(d_sigma),
+        c_c=float(c_c),
+        c_1=float(c_1),
+        c_mu=float(c_mu),
+    )
+
+
+def _eigendecompose_covariance(C: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Return ``(B, D)`` such that ``C ≈ B diag(D²) B.T`` with ``D > 0``."""
+    C = 0.5 * (C + C.T)
+    eigvals, B = np.linalg.eigh(C)
+    eigvals = np.maximum(eigvals, 1e-14)
+    return B, np.sqrt(eigvals)
+
+
+def _decode_cmaes_vector(
+    x: np.ndarray, names: List[str], space: Dict[str, Space]
+) -> Dict[str, Any]:
+    return {
+        name: space[name].denormalize(float(x[j])) for j, name in enumerate(names)
+    }
+
+
+def cmaes_search(
+    space: Dict[str, Space],
+    objective: ScoreFn,
+    budget: int,
+    rng: Optional[np.random.Generator] = None,
+    stop_when: Stopper = None,
+    *,
+    population_size: Optional[int] = None,
+    sigma0: float = 0.3,
+) -> List[Trial]:
+    """CMA-ES search on normalized ``FloatRange`` / ``IntRange`` space.
+
+    Samples offspring from ``N(m, σ² C)`` in the unit cube obtained from
+    :meth:`Space.normalize`, evaluates them, then updates the mean,
+    isotropic step-size (cumulative step-size adaptation) and covariance
+    (rank-1 + rank-μ) from the ``μ`` best points (Hansen, 2016). Integer
+    and log-scaled ranges are handled by denormalize / normalize, so the
+    internal search stays continuous. Categorical parameters are encoded
+    as ordered unit-interval coordinates (same caveat as the GP surrogate).
+
+    ``budget`` counts objective evaluations, matching grid / random / GP /
+    TPE. ``population_size`` defaults to Hansen's ``4 + floor(3 log n)``
+    and is capped by ``budget`` so a short run still completes at least
+    one generation. ``sigma0`` is the initial step-size on the unit cube.
+    """
+    _validate_space(space)
+    if budget < 1:
+        raise ValueError("budget must be >= 1")
+    if not np.isfinite(sigma0) or sigma0 <= 0.0:
+        raise ValueError("sigma0 must be a positive finite number")
+    rng = rng if rng is not None else np.random.default_rng()
+    names = list(space)
+    n = len(names)
+    params = cmaes_parameters(n, population_size=population_size)
+    lam = params.population_size
+    if population_size is None:
+        lam = min(lam, max(2, int(budget)))
+        if lam != params.population_size:
+            params = cmaes_parameters(n, population_size=lam)
+    mu = params.n_parents
+    weights = params.weights
+    mu_eff = params.mu_eff
+    c_sigma = params.c_sigma
+    d_sigma = params.d_sigma
+    c_c = params.c_c
+    c_1 = params.c_1
+    c_mu = params.c_mu
+    chi_n = _chi_expectation(n)
+
+    mean = np.full(n, 0.5, dtype=float)
+    sigma = float(sigma0)
+    C = np.eye(n, dtype=float)
+    p_sigma = np.zeros(n, dtype=float)
+    p_c = np.zeros(n, dtype=float)
+    B, D = _eigendecompose_covariance(C)
+
+    trials: List[Trial] = []
+    best = float("inf")
+    generation = 0
+    pending_y: List[np.ndarray] = []
+    pending_scores: List[float] = []
+
+    def _update_state(ys: List[np.ndarray], scores: List[float]) -> None:
+        nonlocal mean, sigma, C, p_sigma, p_c, B, D, generation
+        if len(ys) < mu:
+            return
+        order = np.argsort(np.asarray(scores, dtype=float), kind="mergesort")
+        y_sel = np.stack([ys[int(i)] for i in order[:mu]], axis=0)
+        y_w = np.sum(weights[:, None] * y_sel, axis=0)
+        mean = np.clip(mean + sigma * y_w, 0.0, 1.0)
+        # C^{-1/2} y_w = B D^{-1} B^T y_w
+        z_w = (B.T @ y_w) / D
+        invsqrt_y = B @ z_w
+        p_sigma = (1.0 - c_sigma) * p_sigma + (
+            math.sqrt(c_sigma * (2.0 - c_sigma) * mu_eff) * invsqrt_y
+        )
+        p_sigma_norm = float(np.linalg.norm(p_sigma))
+        generation += 1
+        denom = math.sqrt(max(1.0 - (1.0 - c_sigma) ** (2.0 * generation), 1e-12))
+        h_sigma = (
+            1.0
+            if p_sigma_norm / denom < (1.4 + 2.0 / (n + 1.0)) * chi_n
+            else 0.0
+        )
+        p_c = (1.0 - c_c) * p_c + (
+            h_sigma * math.sqrt(c_c * (2.0 - c_c) * mu_eff) * y_w
+        )
+        rank_mu = (y_sel * weights[:, None]).T @ y_sel
+        delta_h = (1.0 - h_sigma) * c_c * (2.0 - c_c)
+        C = (
+            (1.0 - c_1 - c_mu + c_1 * delta_h) * C
+            + c_1 * np.outer(p_c, p_c)
+            + c_mu * rank_mu
+        )
+        C = 0.5 * (C + C.T)
+        B, D = _eigendecompose_covariance(C)
+        sigma *= math.exp((c_sigma / d_sigma) * (p_sigma_norm / chi_n - 1.0))
+        sigma = float(np.clip(sigma, 1e-12, 1.0))
+
+    while len(trials) < budget:
+        z = rng.standard_normal(n)
+        y = B @ (D * z)
+        x = np.clip(mean + sigma * y, 0.0, 1.0)
+        # Use the feasible step so clipped samples still update C honestly.
+        y = (x - mean) / max(sigma, 1e-12)
+        config = _decode_cmaes_vector(x, names, space)
+        score = float(objective(config))
+        trials.append(Trial(len(trials), config, score))
+        best = min(best, score)
+        pending_y.append(y)
+        pending_scores.append(score)
+        if stop_when is not None and stop_when(best, len(trials)):
+            break
+        if len(pending_y) >= lam:
+            _update_state(pending_y, pending_scores)
+            pending_y = []
+            pending_scores = []
+
     return trials

@@ -1,12 +1,12 @@
 # hyperparameter-optimization-kit
 
 A small, dependency-light toolkit for hyperparameter and configuration search
-over machine-learning models, built on pure Python and numpy. It ships five
+over machine-learning models, built on pure Python and numpy. It ships six
 search strategies — grid search, random search, a Gaussian-process bayesian
 optimizer with expected-improvement acquisition, Tree-structured Parzen
-Estimator (TPE) search, and Hyperband / successive halving — plus utilities
-for comparing strategies on a common evaluation budget and rendering
-markdown reports of the results.
+Estimator (TPE) search, CMA-ES (covariance-matrix adaptation), and
+Hyperband / successive halving — plus utilities for comparing strategies on
+a common evaluation budget and rendering markdown reports of the results.
 
 ## Features
 
@@ -21,6 +21,12 @@ markdown reports of the results.
   Estimators that split observations at a score quantile, fit independent
   densities `l(x)` (good) and `g(x)` (bad) on the search-space API, and
   pick the candidate that maximizes the `l(x)/g(x)` density ratio.
+- **CMA-ES search** (`hyperopt_kit.searchers`): Hansen CMA-ES on the
+  normalized unit cube. A multivariate Gaussian `N(m, σ²C)` is sampled
+  each generation; the mean, isotropic step-size and covariance are
+  adapted from the ranked offspring. Designed for `FloatRange` /
+  `IntRange` (including log-scaled ranges); categoricals are encoded as
+  ordered coordinates.
 - **Hyperband / successive-halving** (`hyperopt_kit.searchers`): multi-fidelity
   brackets that evaluate many configurations at a cheap resource, discard the
   worst, and promote survivors to higher fidelity. Objectives may accept a
@@ -72,9 +78,10 @@ write_report(render_report(results, space, objective_name="toy"), "report.md")
 ```
 
 Single strategies are available directly: `grid_search`, `random_search`,
-`bayesian_search`, `tpe_search`, `hyperband_search` and `successive_halving`
-each return a list of `Trial`s (`iteration`, `params`, `score`, optional
-`resource`), and `run_search` wraps one of them with early-stopping support.
+`bayesian_search`, `tpe_search`, `cmaes_search`, `hyperband_search` and
+`successive_halving` each return a list of `Trial`s (`iteration`, `params`,
+`score`, optional `resource`), and `run_search` wraps one of them with
+early-stopping support.
 
 ## CLI
 
@@ -82,7 +89,7 @@ each return a list of `Trial`s (`iteration`, `params`, `score`, optional
 # run one strategy
 python -m hyperopt_kit.cli search \
   --space '{"learning_rate": [0.001, 1.0, "log"], "units": [16, 256, "int"]}' \
-  --objective demo --budget 30 --strategy tpe --seed 7
+  --objective demo --budget 30 --strategy cmaes --seed 7
 
 # compare strategies on a common budget
 python -m hyperopt_kit.cli compare --space '{"a": [0.1, 5.0], "b": [0.1, 5.0]}' \
@@ -98,7 +105,9 @@ path. `--space` accepts inline JSON or `@path/to/space.json`. Multi-fidelity
 flags `--eta`, `--min-resource` and `--max-resource` apply to `hyperband` and
 `successive_halving`. `--gamma` is the TPE quantile (fraction of observations
 modeled by `l(x)`); `--n-initial` and `--n-candidates` apply to TPE and
-bayesian search.
+bayesian search. `--population-size` and `--sigma0` configure CMA-ES
+(Hansen's `4 + floor(3 log n)` offspring and unit-cube step-size `0.3` by
+default).
 
 ## Search strategies
 
@@ -108,14 +117,15 @@ bayesian search.
 | `random` | uniform samples from the spaces | trivial, robust to sharp peaks | wastes evaluations in flat regions |
 | `bayesian` | GP surrogate on normalized inputs + expected improvement | sample-efficient on smooth objectives | fragile with nominal categoricals and non-smooth surfaces |
 | `tpe` | Parzen densities `l(x)` / `g(x)` on good vs bad observations; next point maximizes `l/g` | handles mixed numeric/categorical spaces; numpy-only | factorized per parameter, so it misses interactions |
+| `cmaes` | sample `N(m, σ²C)` in normalized space; adapt mean, step-size and covariance from ranked offspring | models parameter interactions via `C`; strong on smooth continuous / integer ranges | not a natural fit for nominal categoricals; needs a few generations to adapt |
 | `hyperband` | several successive-halving brackets with different `(n, r)` allocations | cheap fidelities discard losers early | needs a fidelity-aware objective to save real work; ranking can change across rungs |
 | `successive_halving` | one Hyperband bracket (aggressive early-stop), repeated to fill the budget | simpler than full Hyperband | same fidelity caveats; fewer full-fidelity evaluations |
 
 `compare_strategies` and the CLI `compare` / `report` commands share one
-evaluation budget across `grid`, `random`, `bayesian`, `tpe` and `hyperband` by
-default. Each Hyperband evaluation counts as one trial, matching the other
-searchers; reported winners use the highest-resource score so a noisy cheap
-rung cannot beat a full-fidelity result.
+evaluation budget across `grid`, `random`, `bayesian`, `tpe`, `cmaes` and
+`hyperband` by default. Each Hyperband evaluation counts as one trial, matching
+the other searchers; reported winners use the highest-resource score so a
+noisy cheap rung cannot beat a full-fidelity result.
 
 ## Multi-fidelity objectives
 
@@ -152,9 +162,10 @@ Equivalent dict form: `{"type": "float"|"int", "low": ..., "high": ...,
 python examples/run_demo.py --budget 30 --seed 7
 ```
 
-Runs grid, random, bayesian, TPE and Hyperband search on a noisy two-parameter
-objective with a known minimum of 0 at `(a, b) = (1, 2)`, prints the best
-scores and a learning-curve table, and writes `examples/output/demo_report.md`.
+Runs grid, random, bayesian, TPE, CMA-ES and Hyperband search on a noisy
+two-parameter objective with a known minimum of 0 at `(a, b) = (1, 2)`,
+prints the best scores and a learning-curve table, and writes
+`examples/output/demo_report.md`.
 
 ## Caveats
 
@@ -166,6 +177,12 @@ scores and a learning-curve table, and writes `examples/output/demo_report.md`.
 - TPE likewise starts from random points, then samples from `l(x)` and ranks
   by `l(x)/g(x)`. Densities are factorized per parameter (using normalize /
   denormalize on each `Space`), so strong interactions are not modeled.
+- CMA-ES searches the unit cube from `Space.normalize` / `denormalize`, so
+  log-scaled floats and integers stay continuous internally. It adapts a
+  full covariance and therefore can follow interactions that factorized
+  TPE misses. Give it at least a couple of generations (default
+  population `4 + floor(3 log n)`). Categorical parameters are treated as
+  ordered, same as the GP surrogate.
 - Results on noisy objectives are stochastic — rerun with different seeds to
   gauge stability.
 - Grid search cost grows with the product of per-dimension resolution; keep

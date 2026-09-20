@@ -46,6 +46,7 @@ def test_render_report_contains_all_sections():
     assert "| random |" in text
     assert "| bayesian |" in text
     assert "| tpe |" in text
+    assert "| cmaes |" in text
     assert "| hyperband |" in text
 
 
@@ -143,12 +144,14 @@ def test_write_report_creates_parent_directories(tmp_path):
     assert out.read_text(encoding="utf-8") == "# hi\n"
 
 
-def test_render_report_mentions_tpe_and_hyperband_caveats():
+def test_render_report_mentions_tpe_cmaes_and_hyperband_caveats():
     space = parse_space({"x": [0.0, 1.0]})
     text = render_report(_comparison(space), space)
     assert "Hyperband" in text
     assert "TPE" in text
     assert "l(x)/g(x)" in text
+    assert "CMA-ES" in text
+    assert "covariance" in text
 
 
 def test_render_report_custom_notes_appended():
