@@ -60,6 +60,20 @@ def _population_size(value: str) -> int:
     return n
 
 
+def _unit_fraction(value: str) -> float:
+    x = float(value)
+    if not 0.0 <= x <= 1.0:
+        raise argparse.ArgumentTypeError("must be a float in [0, 1]")
+    return x
+
+
+def _top_n_percent(value: str) -> int:
+    n = int(value)
+    if n < 1 or n > 99:
+        raise argparse.ArgumentTypeError("top-n-percent must be an integer in 1..99")
+    return n
+
+
 def _hyperband_kwargs(args) -> dict:
     kwargs = {
         "eta": args.eta,
@@ -76,7 +90,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="hyperopt-kit",
         description=(
             "Hyperparameter optimization toolkit: grid, random, bayesian, "
-            "TPE, CMA-ES and Hyperband / successive-halving search."
+            "TPE, CMA-ES, Hyperband / successive-halving, and BOHB search."
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
@@ -95,7 +109,8 @@ def build_parser() -> argparse.ArgumentParser:
         )
         p.add_argument("--seed", type=int, default=None, help="seed for reproducibility")
         p.add_argument(
-            "--strategies", default="grid,random,bayesian,tpe,cmaes,hyperband",
+            "--strategies",
+            default="grid,random,bayesian,tpe,cmaes,hyperband,bohb",
             help="comma-separated strategies to run",
         )
         p.add_argument(
@@ -122,6 +137,14 @@ def build_parser() -> argparse.ArgumentParser:
             "--max-resource", type=_positive_int, default=9,
             help="maximum resource units (full fidelity) for multi-fidelity search",
         )
+        p.add_argument(
+            "--top-n-percent", type=_top_n_percent, default=15,
+            help="BOHB: percent of observations at a fidelity treated as good (l(x))",
+        )
+        p.add_argument(
+            "--random-fraction", type=_unit_fraction, default=1.0 / 3.0,
+            help="BOHB: fraction of proposals drawn uniformly instead of from the KDE",
+        )
 
     p_search = sub.add_parser("search", help="run a single search strategy")
     add_common(p_search)
@@ -138,7 +161,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_search.add_argument(
         "--n-candidates", type=_positive_int, default=None,
-        help="TPE / bayesian candidate pool, or successive_halving starting configs",
+        help=(
+            "TPE / bayesian / BOHB candidate pool, or successive_halving starting configs"
+        ),
     )
     p_search.add_argument(
         "--floor", type=float, default=None, help="stop when the best score reaches this"
@@ -180,6 +205,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         "successive_halving": dict(mf_kwargs),
         "tpe": {"gamma": args.gamma},
         "cmaes": {"sigma0": args.sigma0},
+        "bohb": {
+            "eta": mf_kwargs["eta"],
+            "min_resource": mf_kwargs["min_resource"],
+            "max_resource": mf_kwargs["max_resource"],
+            "top_n_percent": args.top_n_percent,
+            "random_fraction": args.random_fraction,
+        },
     }
     if args.population_size is not None:
         strategy_kwargs["cmaes"]["population_size"] = args.population_size
@@ -193,6 +225,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             "eta": mf_kwargs["eta"],
             "min_resource": mf_kwargs["min_resource"],
             "max_resource": mf_kwargs["max_resource"],
+            "top_n_percent": args.top_n_percent,
+            "random_fraction": args.random_fraction,
         }
         if args.population_size is not None:
             extra["population_size"] = args.population_size

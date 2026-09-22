@@ -1,12 +1,13 @@
 # hyperparameter-optimization-kit
 
 A small, dependency-light toolkit for hyperparameter and configuration search
-over machine-learning models, built on pure Python and numpy. It ships six
-search strategies — grid search, random search, a Gaussian-process bayesian
-optimizer with expected-improvement acquisition, Tree-structured Parzen
-Estimator (TPE) search, CMA-ES (covariance-matrix adaptation), and
-Hyperband / successive halving — plus utilities for comparing strategies on
-a common evaluation budget and rendering markdown reports of the results.
+over machine-learning models, built on pure Python and numpy. It ships grid
+search, random search, a Gaussian-process bayesian optimizer with
+expected-improvement acquisition, Tree-structured Parzen Estimator (TPE)
+search, CMA-ES (covariance-matrix adaptation), Hyperband / successive
+halving, and BOHB (Bayesian Optimization Hyperband) — plus utilities for
+comparing strategies on a common evaluation budget and rendering markdown
+reports of the results.
 
 ## Features
 
@@ -32,6 +33,13 @@ a common evaluation budget and rendering markdown reports of the results.
   worst, and promote survivors to higher fidelity. Objectives may accept a
   normalized `resource` (or `fidelity`) in `(0, 1]`; single-argument
   objectives still work.
+- **BOHB** (`hyperopt_kit.searchers`): the same Hyperband brackets, but new
+  configurations are proposed by a multivariate product-kernel density
+  (Gaussian on numeric coordinates, Aitchison–Aitken on categoricals) fit to
+  the best observations at the largest fidelity with enough data. Candidates
+  are drawn from the "good" density and ranked by `l(x)/g(x)`. A fraction of
+  proposals stays uniformly random. Implemented in numpy only — no
+  statsmodels or ConfigSpace dependency.
 - **Evaluation** (`hyperopt_kit.evaluate`): a trial runner that tracks the
   best configuration so far, supports early stopping via a target floor or a
   patience budget, and compares strategies on a common budget with
@@ -65,7 +73,7 @@ space = {
 
 def objective(params, resource=1.0):
     # minimize convention: lower is better
-    # resource in (0, 1] is the Hyperband fidelity (1.0 = full)
+    # resource in (0, 1] is the Hyperband / BOHB fidelity (1.0 = full)
     lr, u = params["learning_rate"], params["units"]
     noise = 0.05 / np.sqrt(max(resource, 1e-12))
     return (np.log(lr) + 0.5) ** 2 + (u - 128.0) ** 2 / 1e4 + noise
@@ -78,10 +86,10 @@ write_report(render_report(results, space, objective_name="toy"), "report.md")
 ```
 
 Single strategies are available directly: `grid_search`, `random_search`,
-`bayesian_search`, `tpe_search`, `cmaes_search`, `hyperband_search` and
-`successive_halving` each return a list of `Trial`s (`iteration`, `params`,
-`score`, optional `resource`), and `run_search` wraps one of them with
-early-stopping support.
+`bayesian_search`, `tpe_search`, `cmaes_search`, `hyperband_search`,
+`bohb_search` and `successive_halving` each return a list of `Trial`s
+(`iteration`, `params`, `score`, optional `resource`), and `run_search`
+wraps one of them with early-stopping support.
 
 ## CLI
 
@@ -102,12 +110,15 @@ python -m hyperopt_kit.cli report --space '{"a": [0.1, 5.0], "b": [0.1, 5.0]}' \
 
 `--objective` accepts the built-in `demo` objective or any `module:function`
 path. `--space` accepts inline JSON or `@path/to/space.json`. Multi-fidelity
-flags `--eta`, `--min-resource` and `--max-resource` apply to `hyperband` and
-`successive_halving`. `--gamma` is the TPE quantile (fraction of observations
-modeled by `l(x)`); `--n-initial` and `--n-candidates` apply to TPE and
-bayesian search. `--population-size` and `--sigma0` configure CMA-ES
+flags `--eta`, `--min-resource` and `--max-resource` apply to `hyperband`,
+`successive_halving` and `bohb`. `--gamma` is the TPE quantile (fraction of
+observations modeled by `l(x)`); `--n-initial` and `--n-candidates` apply to
+TPE and bayesian search, and `--n-candidates` also sets the BOHB candidate
+pool (default 64). `--population-size` and `--sigma0` configure CMA-ES
 (Hansen's `4 + floor(3 log n)` offspring and unit-cube step-size `0.3` by
-default).
+default). `--top-n-percent` (default 15) is the BOHB good-set percentage and
+`--random-fraction` (default 1/3) is the share of BOHB proposals drawn
+uniformly instead of from the kernel density.
 
 ## Search strategies
 
@@ -119,17 +130,19 @@ default).
 | `tpe` | Parzen densities `l(x)` / `g(x)` on good vs bad observations; next point maximizes `l/g` | handles mixed numeric/categorical spaces; numpy-only | factorized per parameter, so it misses interactions |
 | `cmaes` | sample `N(m, σ²C)` in normalized space; adapt mean, step-size and covariance from ranked offspring | models parameter interactions via `C`; strong on smooth continuous / integer ranges | not a natural fit for nominal categoricals; needs a few generations to adapt |
 | `hyperband` | several successive-halving brackets with different `(n, r)` allocations | cheap fidelities discard losers early | needs a fidelity-aware objective to save real work; ranking can change across rungs |
+| `bohb` | Hyperband schedule, but new configs maximize `l(x)/g(x)` under a product-kernel density of the best observations at the largest usable fidelity | multi-fidelity sample efficiency; the joint kernel can express interactions that factorized TPE misses | model is idle until both good and bad sets have more points than the dimension; still needs a fidelity-aware objective |
 | `successive_halving` | one Hyperband bracket (aggressive early-stop), repeated to fill the budget | simpler than full Hyperband | same fidelity caveats; fewer full-fidelity evaluations |
 
 `compare_strategies` and the CLI `compare` / `report` commands share one
-evaluation budget across `grid`, `random`, `bayesian`, `tpe`, `cmaes` and
-`hyperband` by default. Each Hyperband evaluation counts as one trial, matching
-the other searchers; reported winners use the highest-resource score so a
-noisy cheap rung cannot beat a full-fidelity result.
+evaluation budget across `grid`, `random`, `bayesian`, `tpe`, `cmaes`,
+`hyperband` and `bohb` by default. Each Hyperband or BOHB evaluation counts
+as one trial, matching the other searchers; reported winners use the
+highest-resource score so a noisy cheap rung cannot beat a full-fidelity
+result.
 
 ## Multi-fidelity objectives
 
-Hyperband calls `objective(params, resource=r)` when the callable accepts
+Hyperband and BOHB call `objective(params, resource=r)` when the callable accepts
 `resource` or `fidelity` (a float in `(0, 1]`, where `1.0` is full fidelity).
 A one-argument `objective(params)` is still valid — every rung then sees the
 same full evaluation, so successive-halving only re-queries survivors.
@@ -162,7 +175,7 @@ Equivalent dict form: `{"type": "float"|"int", "low": ..., "high": ...,
 python examples/run_demo.py --budget 30 --seed 7
 ```
 
-Runs grid, random, bayesian, TPE, CMA-ES and Hyperband search on a noisy
+Runs grid, random, bayesian, TPE, CMA-ES, Hyperband and BOHB search on a noisy
 two-parameter objective with a known minimum of 0 at `(a, b) = (1, 2)`,
 prints the best scores and a learning-curve table, and writes
 `examples/output/demo_report.md`.
@@ -199,6 +212,22 @@ prints the best scores and a learning-curve table, and writes
 - Default Hyperband uses `eta=3`, `min_resource=1`, `max_resource=9` (rungs
   at fidelity `1/9`, `1/3`, `1`). Increase `max_resource` when the real
   training budget has more geometric rungs.
+- BOHB (Falkner, Klein, Hutter, 2018) keeps that schedule and replaces
+  uniform sampling with a product-kernel density estimator. The kernel is
+  the product of per-coordinate factors centered on each joint observation
+  (Gaussian for `FloatRange` / `IntRange` after `normalize`, Aitchison–Aitken
+  for `Categorical`), so it can represent interactions that factorized TPE
+  cannot. Bandwidths use Scott's normal-reference rule,
+  `h = 1.06 σ n^{-1/(4+d)}`, floored at `min_bandwidth` (default `1e-3`);
+  categorical bandwidths are capped so the kernel stays a valid probability.
+  The model is built only on the largest fidelity where both the good slice
+  (default best 15%) and the following worse slice each have more points
+  than the number of parameters. `min_points_in_model` defaults to
+  `dimension + 1`. One third of proposals (`random_fraction`) are uniform.
+  Sampling widens continuous bandwidths by `bandwidth_factor` (default 3);
+  scoring `l(x)/g(x)` uses the unwidened kernel. Until the model can be
+  fit, BOHB samples uniformly, so it behaves like Hyperband on a short
+  budget.
 
 ## Tests
 

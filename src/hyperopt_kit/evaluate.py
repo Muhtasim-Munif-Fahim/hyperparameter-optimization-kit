@@ -10,6 +10,7 @@ import numpy as np
 from .searchers import (
     Trial,
     bayesian_search,
+    bohb_search,
     cmaes_search,
     grid_search,
     hyperband_search,
@@ -26,6 +27,7 @@ _STRATEGIES = {
     "tpe": tpe_search,
     "cmaes": cmaes_search,
     "hyperband": hyperband_search,
+    "bohb": bohb_search,
     "successive_halving": successive_halving,
 }
 
@@ -36,6 +38,17 @@ _STRATEGY_KWARGS = {
     "tpe": ("gamma", "n_initial", "n_candidates", "prior_weight", "bandwidth_factor"),
     "cmaes": ("population_size", "sigma0"),
     "hyperband": ("eta", "min_resource", "max_resource"),
+    "bohb": (
+        "eta",
+        "min_resource",
+        "max_resource",
+        "top_n_percent",
+        "min_points_in_model",
+        "n_candidates",
+        "random_fraction",
+        "bandwidth_factor",
+        "min_bandwidth",
+    ),
     "successive_halving": ("eta", "min_resource", "max_resource", "n_candidates"),
 }
 
@@ -167,7 +180,15 @@ def compare_strategies(
     space: Dict[str, Space],
     objective,
     budget: int,
-    strategies: Iterable[str] = ("grid", "random", "bayesian", "tpe", "cmaes", "hyperband"),
+    strategies: Iterable[str] = (
+        "grid",
+        "random",
+        "bayesian",
+        "tpe",
+        "cmaes",
+        "hyperband",
+        "bohb",
+    ),
     rng: Optional[np.random.Generator] = None,
     *,
     seed: Optional[int] = None,

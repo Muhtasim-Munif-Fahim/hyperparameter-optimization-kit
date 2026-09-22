@@ -1,8 +1,8 @@
-"""Demo: compare grid, random, bayesian, TPE, CMA-ES and Hyperband search on a noisy toy.
+"""Demo: compare grid, random, bayesian, TPE, CMA-ES, Hyperband and BOHB on a noisy toy.
 
 The demo objective has a known minimum of 0 at (a, b) = (1, 2) plus gaussian
 noise, so you can eyeball how close each strategy gets on the same budget.
-Hyperband additionally sees a cheaper, noisier fidelity of the same surface.
+Hyperband and BOHB additionally see a cheaper, noisier fidelity of the same surface.
 
 Usage: python examples/run_demo.py [--budget 30] [--seed 7]
 """

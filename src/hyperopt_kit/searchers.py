@@ -9,7 +9,10 @@ picks the candidate that maximizes the ``l(x)/g(x)`` density ratio;
 FloatRange / IntRange space and adapts its mean, step-size and covariance
 from ranked offspring (Hansen CMA-ES);
 ``hyperband_search`` / ``successive_halving`` run multi-fidelity brackets
-that spend cheap evaluations to discard poor configurations early.
+that spend cheap evaluations to discard poor configurations early;
+``bohb_search`` keeps that Hyperband schedule but proposes configurations
+from a multivariate product-kernel density of the best observations
+(Falkner, Klein, Hutter, 2018) instead of sampling them uniformly.
 """
 
 from __future__ import annotations
@@ -932,6 +935,609 @@ def hyperband_search(
         if not progressed:
             while len(trials) < budget:
                 params = _sample_config(space, rng)
+                score = float(evaluate(params, 1.0))
+                trials.append(Trial(len(trials), params, score, resource=1.0))
+                if stop_when is not None and stop_when(_best_score(trials), len(trials)):
+                    return trials
+            break
+    return trials
+
+
+_SCOTT_FACTOR = 1.06
+
+
+class ProductKernelDensity:
+    """Multivariate product-kernel density used by BOHB.
+
+    Each observation contributes one kernel, and that kernel is the product
+    of a per-coordinate factor: a Gaussian on continuous (normalized)
+    coordinates and an Aitchison–Aitken kernel on unordered categoricals.
+    Because the factors are centered on the joint observation, the density
+    can put mass on correlated combinations. That is the BOHB surrogate
+    (Falkner et al., 2018), and it is distinct from TPE, which multiplies
+    independent per-parameter densities.
+
+    Bandwidths follow the multivariate normal-reference rule used by the
+    reference implementation (statsmodels ``KDEMultivariate`` with
+    ``bw='normal_reference'``): ``h_j = 1.06 σ_j n^{-1/(4+d)}`` with the
+    population standard deviation ``σ_j``. Continuous bandwidths are floored
+    at ``min_bandwidth``. Categorical bandwidths are also capped at
+    ``(c-1)/c``, the value that makes the Aitchison–Aitken kernel uniform, so
+    the kernel stays a valid probability.
+    """
+
+    def __init__(
+        self,
+        samples: np.ndarray,
+        kinds: str,
+        n_levels: np.ndarray,
+        bandwidth: np.ndarray,
+        min_bandwidth: float,
+    ):
+        self.samples = np.asarray(samples, dtype=float)
+        self.kinds = str(kinds)
+        self.n_levels = np.asarray(n_levels, dtype=int)
+        self.bandwidth = np.asarray(bandwidth, dtype=float)
+        self.min_bandwidth = float(min_bandwidth)
+
+    @classmethod
+    def fit(
+        cls,
+        samples: np.ndarray,
+        kinds: str,
+        n_levels,
+        *,
+        min_bandwidth: float = 1e-3,
+    ) -> "ProductKernelDensity":
+        """Fit Scott / normal-reference bandwidths on ``samples``."""
+        samples = np.asarray(samples, dtype=float)
+        if samples.ndim != 2 or samples.shape[0] == 0:
+            raise ValueError("samples must be a non-empty array of shape (n, d)")
+        n, d = samples.shape
+        kinds = str(kinds)
+        if len(kinds) != d:
+            raise ValueError("kinds must have one character per column")
+        if any(kind not in ("c", "u") for kind in kinds):
+            raise ValueError("kinds must contain only 'c' (continuous) and 'u' (unordered)")
+        n_levels = np.asarray(n_levels, dtype=int).reshape(-1)
+        if n_levels.shape != (d,):
+            raise ValueError("n_levels must have one entry per column")
+        if not np.isfinite(min_bandwidth) or not 0.0 < float(min_bandwidth) <= 1.0:
+            raise ValueError("min_bandwidth must be in (0, 1]")
+        for j, kind in enumerate(kinds):
+            if kind == "u" and int(n_levels[j]) < 1:
+                raise ValueError("unordered coordinates need n_levels >= 1")
+        std = np.std(samples, axis=0)
+        std = np.where(np.isfinite(std), std, 0.0)
+        bandwidth = _SCOTT_FACTOR * std * (float(n) ** (-1.0 / (4.0 + d)))
+        bandwidth = np.maximum(bandwidth, float(min_bandwidth))
+        for j, kind in enumerate(kinds):
+            if kind != "u":
+                continue
+            levels = int(n_levels[j])
+            if levels <= 1:
+                bandwidth[j] = float(min_bandwidth)
+                continue
+            uniform_lambda = (levels - 1) / float(levels)
+            bandwidth[j] = min(float(bandwidth[j]), uniform_lambda)
+        return cls(samples, kinds, n_levels, bandwidth, float(min_bandwidth))
+
+    def logpdf(self, X: np.ndarray) -> np.ndarray:
+        """Log-density at each row of ``X`` (encoded like ``samples``)."""
+        X = np.asarray(X, dtype=float)
+        if X.ndim == 1:
+            X = X.reshape(1, -1)
+        if X.ndim != 2 or X.shape[1] != self.samples.shape[1]:
+            raise ValueError("X must have one column per parameter")
+        n = self.samples.shape[0]
+        log_comp = np.zeros((X.shape[0], n), dtype=float)
+        for j, kind in enumerate(self.kinds):
+            h = max(float(self.bandwidth[j]), 1e-12)
+            column = self.samples[:, j]
+            query = X[:, j]
+            if kind == "c":
+                z = (query[:, None] - column[None, :]) / h
+                log_comp += -0.5 * np.log(2.0 * np.pi) - 0.5 * z * z - np.log(h)
+            else:
+                levels = int(self.n_levels[j])
+                if levels <= 1:
+                    continue
+                match = np.isclose(query[:, None], column[None, :])
+                log_match = math.log(max(1.0 - h, 1e-300))
+                log_other = math.log(max(h / (levels - 1), 1e-300))
+                log_comp += np.where(match, log_match, log_other)
+        return _logsumexp(log_comp, axis=1) - math.log(n)
+
+    def sample(
+        self,
+        rng: np.random.Generator,
+        n: int,
+        bandwidth_factor: float = 1.0,
+    ) -> np.ndarray:
+        """Draw ``n`` rows from the kernel.
+
+        Continuous coordinates are sampled from a normal truncated to
+        ``[0, 1]``, with the bandwidth widened by ``bandwidth_factor`` (BOHB
+        uses this only when proposing, not when scoring ``l(x)/g(x)``).
+        Categorical coordinates follow the Aitchison–Aitken kernel: keep the
+        observed level with probability ``1 - λ``, otherwise draw uniformly
+        from the other levels.
+        """
+        if int(n) != n or int(n) < 1:
+            raise ValueError("n must be an integer >= 1")
+        if not np.isfinite(bandwidth_factor) or float(bandwidth_factor) <= 0.0:
+            raise ValueError("bandwidth_factor must be a positive finite number")
+        choice = rng.integers(0, self.samples.shape[0], size=int(n))
+        drawn = self.samples[choice].copy()
+        for j, kind in enumerate(self.kinds):
+            # Bandwidths were already floored (and categorical ones capped)
+            # in fit(); do not raise a categorical λ back above (c - 1) / c.
+            h = float(self.bandwidth[j])
+            if kind == "c":
+                scale = max(h, self.min_bandwidth) * float(bandwidth_factor)
+                for i in range(int(n)):
+                    drawn[i, j] = _truncated_normal(
+                        rng, float(drawn[i, j]), scale, 0.0, 1.0, 1
+                    )[0]
+            else:
+                levels = int(self.n_levels[j])
+                if levels <= 1:
+                    drawn[:, j] = 0.0
+                    continue
+                keep_prob = 1.0 - h
+                for i in range(int(n)):
+                    current = int(np.clip(round(float(drawn[i, j])), 0, levels - 1))
+                    if float(rng.random()) < keep_prob:
+                        drawn[i, j] = current
+                    else:
+                        alt = int(rng.integers(0, levels - 1))
+                        if alt >= current:
+                            alt += 1
+                        drawn[i, j] = float(alt)
+        return drawn
+
+
+def _validate_bohb_params(
+    dimension: int,
+    top_n_percent: int,
+    min_points_in_model: Optional[int],
+    n_candidates: int,
+    random_fraction: float,
+    bandwidth_factor: float,
+    min_bandwidth: float,
+) -> int:
+    """Validate BOHB knobs and return the resolved ``min_points_in_model``."""
+    if int(dimension) != dimension or int(dimension) < 1:
+        raise ValueError("dimension must be an integer >= 1")
+    if isinstance(top_n_percent, bool) or not isinstance(top_n_percent, (int, np.integer)):
+        raise ValueError("top_n_percent must be an integer in 1..99")
+    if not 1 <= int(top_n_percent) <= 99:
+        raise ValueError("top_n_percent must be an integer in 1..99")
+    minimum = int(dimension) + 1
+    if min_points_in_model is None:
+        min_points = minimum
+    else:
+        if isinstance(min_points_in_model, bool) or not isinstance(
+            min_points_in_model, (int, np.integer)
+        ):
+            raise ValueError("min_points_in_model must be an integer >= dimension + 1")
+        min_points = int(min_points_in_model)
+        if min_points < minimum:
+            raise ValueError(
+                f"min_points_in_model must be >= dimension + 1 ({minimum})"
+            )
+    if isinstance(n_candidates, bool) or not isinstance(n_candidates, (int, np.integer)):
+        raise ValueError("n_candidates must be an integer >= 1")
+    if int(n_candidates) < 1:
+        raise ValueError("n_candidates must be an integer >= 1")
+    if not np.isfinite(random_fraction) or not 0.0 <= float(random_fraction) <= 1.0:
+        raise ValueError("random_fraction must be in [0, 1]")
+    if not np.isfinite(bandwidth_factor) or float(bandwidth_factor) <= 0.0:
+        raise ValueError("bandwidth_factor must be a positive finite number")
+    if not np.isfinite(min_bandwidth) or not 0.0 < float(min_bandwidth) <= 1.0:
+        raise ValueError("min_bandwidth must be in (0, 1]")
+    return min_points
+
+
+def _resource_key(resource: Optional[float]) -> float:
+    if resource is None:
+        return 1.0
+    return round(float(resource), 10)
+
+
+def _bohb_split_pool(
+    pool: List[Trial],
+    dimension: int,
+    top_n_percent: int,
+    min_points: int,
+) -> Optional[Tuple[List[Trial], List[Trial]]]:
+    """Good/bad split for one fidelity, or ``None`` when a KDE cannot be fit.
+
+    ``n_good`` is the larger of ``min_points`` and ``top_n_percent`` percent
+    of the pool (integer arithmetic, as in HpBandSter). ``n_bad`` is the
+    larger of ``min_points`` and the complementary percent, taken from the
+    observations immediately after the good set. Both slices must contain
+    more points than there are parameters.
+    """
+    n = len(pool)
+    if n < min_points:
+        return None
+    n_good = max(min_points, (int(top_n_percent) * n) // 100)
+    n_bad = max(min_points, ((100 - int(top_n_percent)) * n) // 100)
+    order = sorted(range(n), key=lambda i: pool[i].score)
+    good_idx = order[:n_good]
+    bad_idx = order[n_good : n_good + n_bad]
+    if len(good_idx) <= dimension or len(bad_idx) <= dimension:
+        return None
+    return [pool[i] for i in good_idx], [pool[i] for i in bad_idx]
+
+
+def bohb_select_trials(
+    trials: List[Trial],
+    dimension: int,
+    *,
+    top_n_percent: int = 15,
+    min_points_in_model: Optional[int] = None,
+) -> Optional[Tuple[List[Trial], List[Trial]]]:
+    """Largest fidelity whose good/bad sets can both fit a product KDE.
+
+    Losses at different fidelities are not pooled: a cheap rung and a full
+    run do not share a scale. Among fidelities with enough points, the
+    largest one is used. Returns ``(good, bad)`` or ``None`` when every
+    fidelity is still too small. ``min_points_in_model`` defaults to
+    ``dimension + 1``.
+    """
+    if int(dimension) != dimension or int(dimension) < 1:
+        raise ValueError("dimension must be an integer >= 1")
+    min_points = _validate_bohb_params(
+        int(dimension),
+        top_n_percent,
+        min_points_in_model,
+        n_candidates=1,
+        random_fraction=0.0,
+        bandwidth_factor=1.0,
+        min_bandwidth=1e-3,
+    )
+    groups: Dict[float, List[Trial]] = {}
+    for trial in trials:
+        groups.setdefault(_resource_key(trial.resource), []).append(trial)
+    for key in sorted(groups, reverse=True):
+        split = _bohb_split_pool(groups[key], int(dimension), int(top_n_percent), min_points)
+        if split is not None:
+            return split
+    return None
+
+
+def _space_layout(space: Dict[str, Space], names: List[str]) -> Tuple[str, np.ndarray]:
+    kinds: List[str] = []
+    n_levels: List[int] = []
+    for name in names:
+        sp = space[name]
+        if isinstance(sp, Categorical):
+            kinds.append("u")
+            n_levels.append(len(sp.choices))
+        else:
+            kinds.append("c")
+            n_levels.append(0)
+    return "".join(kinds), np.asarray(n_levels, dtype=int)
+
+
+def _encode_params(
+    space: Dict[str, Space], names: List[str], params: Dict[str, Any]
+) -> np.ndarray:
+    row = np.empty(len(names), dtype=float)
+    for j, name in enumerate(names):
+        sp = space[name]
+        if isinstance(sp, Categorical):
+            row[j] = float(sp.choices.index(params[name]))
+        else:
+            row[j] = float(sp.normalize(params[name]))
+    return row
+
+
+def _encode_trials(
+    space: Dict[str, Space], names: List[str], trials: List[Trial]
+) -> np.ndarray:
+    return np.vstack([_encode_params(space, names, trial.params) for trial in trials])
+
+
+def _decode_vector(
+    space: Dict[str, Space], names: List[str], vector: np.ndarray
+) -> Dict[str, Any]:
+    params: Dict[str, Any] = {}
+    for j, name in enumerate(names):
+        sp = space[name]
+        if isinstance(sp, Categorical):
+            idx = int(np.clip(round(float(vector[j])), 0, len(sp.choices) - 1))
+            params[name] = sp.choices[idx]
+        else:
+            params[name] = sp.denormalize(float(vector[j]))
+    return params
+
+
+def _fit_bohb_kdes(
+    space: Dict[str, Space],
+    names: List[str],
+    good: List[Trial],
+    bad: List[Trial],
+    min_bandwidth: float,
+) -> Tuple[ProductKernelDensity, ProductKernelDensity]:
+    kinds, n_levels = _space_layout(space, names)
+    good_kde = ProductKernelDensity.fit(
+        _encode_trials(space, names, good), kinds, n_levels, min_bandwidth=min_bandwidth
+    )
+    bad_kde = ProductKernelDensity.fit(
+        _encode_trials(space, names, bad), kinds, n_levels, min_bandwidth=min_bandwidth
+    )
+    return good_kde, bad_kde
+
+
+def bohb_log_density_ratio(
+    params: Dict[str, Any],
+    space: Dict[str, Space],
+    trials: List[Trial],
+    *,
+    top_n_percent: int = 15,
+    min_points_in_model: Optional[int] = None,
+    min_bandwidth: float = 1e-3,
+) -> float:
+    """``log l(x) - log g(x)`` for ``params`` under the BOHB product KDEs.
+
+    ``l`` is the product-kernel density of the best observations at the
+    largest fidelity that can support a model; ``g`` is the density of the
+    following (worse) slice. BOHB ranks candidates by this ratio, which is
+    the TPE acquisition written with a joint kernel instead of factorized
+    Parzen estimators. Raises ``ValueError`` when no fidelity has enough
+    points to fit both densities.
+    """
+    _validate_space(space)
+    names = list(space)
+    selected = bohb_select_trials(
+        trials,
+        len(names),
+        top_n_percent=top_n_percent,
+        min_points_in_model=min_points_in_model,
+    )
+    if selected is None:
+        raise ValueError(
+            "not enough observations at any fidelity to fit a BOHB model"
+        )
+    good, bad = selected
+    _validate_bohb_params(
+        len(names),
+        top_n_percent,
+        min_points_in_model if min_points_in_model is not None else len(names) + 1,
+        n_candidates=1,
+        random_fraction=0.0,
+        bandwidth_factor=1.0,
+        min_bandwidth=min_bandwidth,
+    )
+    good_kde, bad_kde = _fit_bohb_kdes(space, names, good, bad, min_bandwidth)
+    encoded = _encode_params(space, names, params).reshape(1, -1)
+    return float(good_kde.logpdf(encoded)[0] - bad_kde.logpdf(encoded)[0])
+
+
+def bohb_propose(
+    space: Dict[str, Space],
+    trials: List[Trial],
+    rng: np.random.Generator,
+    *,
+    top_n_percent: int = 15,
+    min_points_in_model: Optional[int] = None,
+    n_candidates: int = 64,
+    random_fraction: float = 1.0 / 3.0,
+    bandwidth_factor: float = 3.0,
+    min_bandwidth: float = 1e-3,
+) -> Dict[str, Any]:
+    """Propose one configuration from the BOHB model, or uniformly at random.
+
+    Whenever no fidelity has enough data, the proposal is uniform. Once a
+    model can be fit, a further ``random_fraction`` of proposals (drawn only
+    in that case) are uniform as well. Otherwise ``n_candidates``
+    configurations are drawn from the good-set product kernel, continuous
+    bandwidths widened by ``bandwidth_factor``, and the candidate maximizing
+    ``l(x)/g(x)`` is returned.
+    """
+    _validate_space(space)
+    names = list(space)
+    _validate_bohb_params(
+        len(names),
+        top_n_percent,
+        min_points_in_model,
+        n_candidates,
+        random_fraction,
+        bandwidth_factor,
+        min_bandwidth,
+    )
+    selected = bohb_select_trials(
+        trials,
+        len(names),
+        top_n_percent=top_n_percent,
+        min_points_in_model=min_points_in_model,
+    )
+    if (
+        selected is None
+        or float(random_fraction) >= 1.0
+        or (
+            float(random_fraction) > 0.0
+            and float(rng.random()) < float(random_fraction)
+        )
+    ):
+        return _sample_config(space, rng)
+    good, bad = selected
+    good_kde, bad_kde = _fit_bohb_kdes(space, names, good, bad, min_bandwidth)
+    samples = good_kde.sample(rng, int(n_candidates), bandwidth_factor=bandwidth_factor)
+    log_l = good_kde.logpdf(samples)
+    log_g = bad_kde.logpdf(samples)
+    ratio = log_l - log_g
+    if not np.any(np.isfinite(ratio)):
+        finite_l = np.flatnonzero(np.isfinite(log_l))
+        if finite_l.size == 0:
+            return _sample_config(space, rng)
+        idx = int(finite_l[0])
+    else:
+        idx = int(np.argmax(np.where(np.isfinite(ratio), ratio, -np.inf)))
+    return _decode_vector(space, names, samples[idx])
+
+
+def _run_bohb_bracket(
+    *,
+    evaluate: Callable[[Dict[str, Any], float], float],
+    propose: Callable[[], Dict[str, Any]],
+    n: int,
+    r: float,
+    s: int,
+    eta: int,
+    max_resource: int,
+    trials: List[Trial],
+    budget: int,
+    stop_when: Stopper,
+) -> bool:
+    """One successive-halving bracket with model-based proposals on rung 0.
+
+    Later rungs only promote survivors, matching Hyperband. New
+    configurations are drawn one at a time so each proposal sees the
+    evaluations already recorded in ``trials``.
+    """
+    if n < 1 or len(trials) >= budget:
+        return len(trials) >= budget
+
+    configs: List[Dict[str, Any]] = []
+    for i in range(s + 1):
+        if len(trials) >= budget:
+            break
+        n_i = max(1, int(math.floor(n * (eta ** (-i)))))
+        r_i = min(float(max_resource), r * (eta**i))
+        fidelity = float(r_i) / float(max_resource)
+        scores: List[float] = []
+        if i == 0:
+            n_i = min(int(n), n_i)
+            configs = []
+            for _ in range(n_i):
+                if len(trials) >= budget:
+                    return True
+                params = dict(propose())
+                score = float(evaluate(params, fidelity))
+                trials.append(Trial(len(trials), params, score, resource=fidelity))
+                configs.append(params)
+                scores.append(score)
+                if stop_when is not None and stop_when(_best_score(trials), len(trials)):
+                    return True
+        else:
+            if not configs:
+                break
+            n_i = min(len(configs), n_i)
+            configs = configs[:n_i]
+            for params in configs:
+                if len(trials) >= budget:
+                    return True
+                score = float(evaluate(dict(params), fidelity))
+                trials.append(
+                    Trial(len(trials), dict(params), score, resource=fidelity)
+                )
+                scores.append(score)
+                if stop_when is not None and stop_when(_best_score(trials), len(trials)):
+                    return True
+        if i < s and scores:
+            k = max(1, int(math.floor(len(configs) / eta)))
+            k = min(k, len(configs))
+            order = sorted(range(len(scores)), key=lambda j: scores[j])
+            configs = [configs[j] for j in order[:k]]
+    return len(trials) >= budget
+
+
+def bohb_search(
+    space: Dict[str, Space],
+    objective: ScoreFn,
+    budget: int,
+    rng: Optional[np.random.Generator] = None,
+    stop_when: Stopper = None,
+    *,
+    eta: int = 3,
+    min_resource: int = 1,
+    max_resource: int = 9,
+    top_n_percent: int = 15,
+    min_points_in_model: Optional[int] = None,
+    n_candidates: int = 64,
+    random_fraction: float = 1.0 / 3.0,
+    bandwidth_factor: float = 3.0,
+    min_bandwidth: float = 1e-3,
+) -> List[Trial]:
+    """BOHB: Hyperband brackets with a product-kernel configuration model.
+
+    The bracket schedule is the same as :func:`hyperband_search` (Li et al.,
+    2018, via Falkner et al., 2018). Configurations that start a bracket are
+    not drawn uniformly. Once the largest fidelity with enough evaluations
+    can fit two product-kernel densities — the best ``top_n_percent`` and a
+    worse slice — candidates are sampled from the good density and the one
+    with the largest ``l(x)/g(x)`` is evaluated. A ``random_fraction`` of
+    proposals (default one third) stays uniform so the model cannot collapse
+    the search. ``min_points_in_model`` defaults to ``dimension + 1``.
+
+    ``budget`` counts objective calls, matching the other searchers. Fidelity
+    is a normalized ``resource`` in ``(0, 1]``; see :func:`successive_halving`.
+    No dependencies beyond numpy: the KDE replaces statsmodels'
+    ``KDEMultivariate``.
+    """
+    _validate_space(space)
+    if budget < 1:
+        raise ValueError("budget must be >= 1")
+    _validate_hyperband_params(eta, min_resource, max_resource)
+    names = list(space)
+    _validate_bohb_params(
+        len(names),
+        top_n_percent,
+        min_points_in_model,
+        n_candidates,
+        random_fraction,
+        bandwidth_factor,
+        min_bandwidth,
+    )
+    rng = rng if rng is not None else np.random.default_rng()
+    brackets = hyperband_brackets(max_resource, eta, min_resource)
+    evaluate = _resource_caller(objective)
+    trials: List[Trial] = []
+
+    def propose() -> Dict[str, Any]:
+        return bohb_propose(
+            space,
+            trials,
+            rng,
+            top_n_percent=top_n_percent,
+            min_points_in_model=min_points_in_model,
+            n_candidates=n_candidates,
+            random_fraction=random_fraction,
+            bandwidth_factor=bandwidth_factor,
+            min_bandwidth=min_bandwidth,
+        )
+
+    while len(trials) < budget:
+        progressed = False
+        for s, n, r in brackets:
+            remaining = budget - len(trials)
+            if remaining <= 0:
+                break
+            n_use = min(int(n), remaining)
+            before = len(trials)
+            stopped = _run_bohb_bracket(
+                evaluate=evaluate,
+                propose=propose,
+                n=n_use,
+                r=r,
+                s=s,
+                eta=eta,
+                max_resource=max_resource,
+                trials=trials,
+                budget=budget,
+                stop_when=stop_when,
+            )
+            if len(trials) > before:
+                progressed = True
+            if stopped:
+                return trials
+        if not progressed:
+            while len(trials) < budget:
+                params = propose()
                 score = float(evaluate(params, 1.0))
                 trials.append(Trial(len(trials), params, score, resource=1.0))
                 if stop_when is not None and stop_when(_best_score(trials), len(trials)):

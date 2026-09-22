@@ -66,7 +66,7 @@ def test_run_search_cmaes_returns_runresult():
     assert result.best_params["x"] == pytest.approx(0.5, abs=0.25)
 
 
-def test_available_strategies_lists_tpe_cmaes_and_hyperband():
+def test_available_strategies_lists_tpe_cmaes_hyperband_and_bohb():
     names = available_strategies()
     assert names == [
         "grid",
@@ -75,6 +75,7 @@ def test_available_strategies_lists_tpe_cmaes_and_hyperband():
         "tpe",
         "cmaes",
         "hyperband",
+        "bohb",
         "successive_halving",
     ]
 
@@ -181,12 +182,21 @@ def test_learning_curve_is_monotone_non_increasing():
 
 def test_compare_strategies_common_budget():
     results = compare_strategies(_space(), _objective, budget=20, seed=7)
-    assert set(results) == {"grid", "random", "bayesian", "tpe", "cmaes", "hyperband"}
+    assert set(results) == {
+        "grid",
+        "random",
+        "bayesian",
+        "tpe",
+        "cmaes",
+        "hyperband",
+        "bohb",
+    }
     assert len(results["random"].trials) == 20
     assert len(results["bayesian"].trials) == 20
     assert len(results["tpe"].trials) == 20
     assert len(results["cmaes"].trials) == 20
     assert len(results["hyperband"].trials) == 20
+    assert len(results["bohb"].trials) == 20
     assert len(results["grid"].trials) <= 20
 
 
@@ -219,7 +229,15 @@ def test_compare_strategies_per_strategy_kwargs():
         seed=7,
         strategy_kwargs={"bayesian": {"xi": 0.5}},
     )
-    assert set(results) == {"grid", "random", "bayesian", "tpe", "cmaes", "hyperband"}
+    assert set(results) == {
+        "grid",
+        "random",
+        "bayesian",
+        "tpe",
+        "cmaes",
+        "hyperband",
+        "bohb",
+    }
 
 
 def test_compare_strategies_subset():
