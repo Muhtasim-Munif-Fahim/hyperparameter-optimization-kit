@@ -87,6 +87,7 @@ def test_compare_subcommand_prints_table(capsys):
     assert "| tpe |" in out
     assert "| cmaes |" in out
     assert "| hyperband |" in out
+    assert "| bohb |" in out
 
 
 def test_search_hyperband_subcommand(capsys):
@@ -120,6 +121,18 @@ def test_search_tpe_subcommand(capsys):
     out = capsys.readouterr().out
     assert rc == 0
     assert "strategy: tpe" in out
+    assert "trials: 10" in out
+
+
+def test_search_bohb_subcommand(capsys):
+    rc = main(
+        ["search", "--space", SPACE, "--objective", "demo", "--budget", "10",
+         "--strategy", "bohb", "--seed", "2", "--top-n-percent", "15",
+         "--random-fraction", "0.3", "--n-candidates", "8"]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "strategy: bohb" in out
     assert "trials: 10" in out
 
 

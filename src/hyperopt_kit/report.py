@@ -197,6 +197,15 @@ def render_report(
         "increasing fidelities; reported best scores use the highest-resource "
         "rung so a lucky cheap evaluation cannot win the comparison."
     )
+    lines.append(
+        "- BOHB uses the same successive-halving brackets as Hyperband, but "
+        "proposes new configurations from a multivariate product kernel fit "
+        "to the best observations at the largest fidelity with enough data. "
+        "A fraction of proposals stays uniformly random. The product kernel "
+        "can represent interactions that factorized TPE misses; the model "
+        "stays idle until both the good and bad sets have more points than "
+        "the number of parameters."
+    )
     if strategy_notes:
         for note in strategy_notes:
             lines.append(f"- {note}")

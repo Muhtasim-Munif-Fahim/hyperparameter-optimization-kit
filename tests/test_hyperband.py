@@ -251,7 +251,7 @@ def test_best_trial_prefers_high_resource():
 
 def test_compare_strategies_includes_hyperband():
     results = compare_strategies(_space(), _obj, budget=10, seed=7)
-    assert set(results) >= {"grid", "random", "bayesian", "tpe", "cmaes", "hyperband"}
+    assert set(results) >= {"grid", "random", "bayesian", "tpe", "cmaes", "hyperband", "bohb"}
     assert len(results["hyperband"].trials) == 10
 
 

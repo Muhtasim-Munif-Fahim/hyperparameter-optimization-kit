@@ -48,6 +48,7 @@ def test_render_report_contains_all_sections():
     assert "| tpe |" in text
     assert "| cmaes |" in text
     assert "| hyperband |" in text
+    assert "| bohb |" in text
 
 
 def test_render_report_includes_objective_and_budget():
@@ -144,7 +145,7 @@ def test_write_report_creates_parent_directories(tmp_path):
     assert out.read_text(encoding="utf-8") == "# hi\n"
 
 
-def test_render_report_mentions_tpe_cmaes_and_hyperband_caveats():
+def test_render_report_mentions_tpe_cmaes_hyperband_and_bohb_caveats():
     space = parse_space({"x": [0.0, 1.0]})
     text = render_report(_comparison(space), space)
     assert "Hyperband" in text
@@ -152,6 +153,8 @@ def test_render_report_mentions_tpe_cmaes_and_hyperband_caveats():
     assert "l(x)/g(x)" in text
     assert "CMA-ES" in text
     assert "covariance" in text
+    assert "BOHB" in text
+    assert "product kernel" in text
 
 
 def test_render_report_custom_notes_appended():
