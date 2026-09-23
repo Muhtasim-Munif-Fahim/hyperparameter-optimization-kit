@@ -101,6 +101,31 @@ def test_search_hyperband_subcommand(capsys):
     assert "trials: 10" in out
 
 
+def test_search_random_successive_halving_subcommand(capsys):
+    rc = main(
+        ["search", "--space", SPACE, "--objective", "demo", "--budget", "10",
+         "--strategy", "random_successive_halving", "--seed", "2", "--eta", "3",
+         "--max-resource", "9"]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "strategy: random_successive_halving" in out
+    assert "trials: 10" in out
+
+
+def test_compare_random_successive_halving_only(capsys):
+    rc = main(
+        ["compare", "--space", SPACE, "--objective", "demo", "--budget", "8",
+         "--seed", "3", "--strategies", "random,random_successive_halving",
+         "--eta", "2", "--max-resource", "8"]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "| random |" in out
+    assert "| random_successive_halving |" in out
+    assert "| grid |" not in out
+
+
 def test_search_successive_halving_subcommand(capsys):
     rc = main(
         ["search", "--space", SPACE, "--objective", "demo", "--budget", "10",

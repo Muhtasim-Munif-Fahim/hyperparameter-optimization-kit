@@ -5,9 +5,15 @@ over machine-learning models, built on pure Python and numpy. It ships grid
 search, random search, a Gaussian-process bayesian optimizer with
 expected-improvement acquisition, Tree-structured Parzen Estimator (TPE)
 search, CMA-ES (covariance-matrix adaptation), Hyperband / successive
-halving, and BOHB (Bayesian Optimization Hyperband) — plus utilities for
-comparing strategies on a common evaluation budget and rendering markdown
-reports of the results.
+halving, BOHB (Bayesian Optimization Hyperband), and random search with
+successive-halving early stopping — plus utilities for comparing strategies
+on a common evaluation budget and rendering markdown reports of the results.
+
+Gaussian-process expected improvement is already in the toolkit
+(`GaussianProcess`, `expected_improvement`, `bayesian_search`). The searcher
+added beside it is `random_successive_halving`: uniform random configurations
+that are stopped early unless they stay in the top `1/eta` of their current
+fidelity rung.
 
 ## Features
 
@@ -33,6 +39,12 @@ reports of the results.
   worst, and promote survivors to higher fidelity. Objectives may accept a
   normalized `resource` (or `fidelity`) in `(0, 1]`; single-argument
   objectives still work.
+- **Random search with successive-halving early stopping**
+  (`random_successive_halving`): the same uniform draws as `random_search`,
+  but each configuration starts at the cheapest fidelity and continues only
+  while it ranks in the running top `1/eta` of that rung (ASHA-style). This
+  is not a second GP-EI optimizer, and it is not the closed cohort inside
+  `successive_halving`.
 - **BOHB** (`hyperopt_kit.searchers`): the same Hyperband brackets, but new
   configurations are proposed by a multivariate product-kernel density
   (Gaussian on numeric coordinates, Aitchison–Aitken on categoricals) fit to
@@ -87,9 +99,9 @@ write_report(render_report(results, space, objective_name="toy"), "report.md")
 
 Single strategies are available directly: `grid_search`, `random_search`,
 `bayesian_search`, `tpe_search`, `cmaes_search`, `hyperband_search`,
-`bohb_search` and `successive_halving` each return a list of `Trial`s
-(`iteration`, `params`, `score`, optional `resource`), and `run_search`
-wraps one of them with early-stopping support.
+`bohb_search`, `successive_halving` and `random_successive_halving` each
+return a list of `Trial`s (`iteration`, `params`, `score`, optional
+`resource`), and `run_search` wraps one of them with early-stopping support.
 
 ## CLI
 
@@ -111,8 +123,9 @@ python -m hyperopt_kit.cli report --space '{"a": [0.1, 5.0], "b": [0.1, 5.0]}' \
 `--objective` accepts the built-in `demo` objective or any `module:function`
 path. `--space` accepts inline JSON or `@path/to/space.json`. Multi-fidelity
 flags `--eta`, `--min-resource` and `--max-resource` apply to `hyperband`,
-`successive_halving` and `bohb`. `--gamma` is the TPE quantile (fraction of
-observations modeled by `l(x)`); `--n-initial` and `--n-candidates` apply to
+`successive_halving`, `random_successive_halving` and `bohb`. `--gamma` is
+the TPE quantile (fraction of observations modeled by `l(x)`); `--n-initial`
+and `--n-candidates` apply to
 TPE and bayesian search, and `--n-candidates` also sets the BOHB candidate
 pool (default 64). `--population-size` and `--sigma0` configure CMA-ES
 (Hansen's `4 + floor(3 log n)` offspring and unit-cube step-size `0.3` by
@@ -132,17 +145,21 @@ uniformly instead of from the kernel density.
 | `hyperband` | several successive-halving brackets with different `(n, r)` allocations | cheap fidelities discard losers early | needs a fidelity-aware objective to save real work; ranking can change across rungs |
 | `bohb` | Hyperband schedule, but new configs maximize `l(x)/g(x)` under a product-kernel density of the best observations at the largest usable fidelity | multi-fidelity sample efficiency; the joint kernel can express interactions that factorized TPE misses | model is idle until both good and bad sets have more points than the dimension; still needs a fidelity-aware objective |
 | `successive_halving` | one Hyperband bracket (aggressive early-stop), repeated to fill the budget | simpler than full Hyperband | same fidelity caveats; fewer full-fidelity evaluations |
+| `random_successive_halving` | uniform random configs; continue one only when it is in the running top `1/eta` at its current fidelity | stops poor random trials before full fidelity; no closed cohort to wait for | needs a fidelity-aware objective to save real work; distinct from bracket `successive_halving` |
 
 `compare_strategies` and the CLI `compare` / `report` commands share one
 evaluation budget across `grid`, `random`, `bayesian`, `tpe`, `cmaes`,
-`hyperband` and `bohb` by default. Each Hyperband or BOHB evaluation counts
-as one trial, matching the other searchers; reported winners use the
-highest-resource score so a noisy cheap rung cannot beat a full-fidelity
-result.
+`hyperband` and `bohb` by default. `random_successive_halving` is registered
+for `--strategy` / `--strategies` and is left out of that default set, same
+as `successive_halving`. Each Hyperband, BOHB, or early-stopping random
+evaluation counts as one trial, matching the other searchers; reported
+winners use the highest-resource score so a noisy cheap rung cannot beat a
+full-fidelity result.
 
 ## Multi-fidelity objectives
 
-Hyperband and BOHB call `objective(params, resource=r)` when the callable accepts
+Hyperband, successive halving, random successive-halving and BOHB call
+`objective(params, resource=r)` when the callable accepts
 `resource` or `fidelity` (a float in `(0, 1]`, where `1.0` is full fidelity).
 A one-argument `objective(params)` is still valid — every rung then sees the
 same full evaluation, so successive-halving only re-queries survivors.
@@ -212,6 +229,18 @@ prints the best scores and a learning-curve table, and writes
 - Default Hyperband uses `eta=3`, `min_resource=1`, `max_resource=9` (rungs
   at fidelity `1/9`, `1/3`, `1`). Increase `max_resource` when the real
   training budget has more geometric rungs.
+- `random_successive_halving` uses that same fidelity ladder, but it does
+  not wait for a bracket. A new configuration is drawn uniformly and
+  evaluated at the cheapest rung. It is promoted only after the rung has at
+  least `eta` scores and the configuration is still among the best
+  `floor(n / eta)` (ties keep the earlier observation). Otherwise it is
+  stopped and the next evaluation is either a better survivor or a fresh
+  random configuration. With `max_resource == min_resource` the ladder has
+  one rung, nothing is stopped early, and the samples match `random_search`
+  on the same generator. Pass it explicitly (`--strategy
+  random_successive_halving` or `strategies=("random_successive_halving",)`);
+  it is not in the default comparison set. GP-EI was already available, so
+  this is the method added in its place.
 - BOHB (Falkner, Klein, Hutter, 2018) keeps that schedule and replaces
   uniform sampling with a product-kernel density estimator. The kernel is
   the product of per-coordinate factors centered on each joint observation

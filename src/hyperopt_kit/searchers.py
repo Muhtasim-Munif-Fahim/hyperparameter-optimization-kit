@@ -10,6 +10,12 @@ FloatRange / IntRange space and adapts its mean, step-size and covariance
 from ranked offspring (Hansen CMA-ES);
 ``hyperband_search`` / ``successive_halving`` run multi-fidelity brackets
 that spend cheap evaluations to discard poor configurations early;
+``random_successive_halving`` draws the same uniform configurations as
+``random_search`` and stops them with that successive-halving rule on an
+open-ended stream (a configuration continues only while it stays in the
+top ``1/eta`` of its current rung. Gaussian-process expected improvement
+is already provided by ``bayesian_search``; the early-stopping random
+search is the method added beside it.
 ``bohb_search`` keeps that Hyperband schedule but proposes configurations
 from a multivariate product-kernel density of the best observations
 (Falkner, Klein, Hutter, 2018) instead of sampling them uniformly.
@@ -872,6 +878,151 @@ def successive_halving(
         if stopped:
             break
         if n_use < 1:
+            break
+    return trials
+
+
+def successive_halving_rungs(
+    max_resource: int = 9,
+    eta: int = 3,
+    min_resource: int = 1,
+) -> List[float]:
+    """Normalized fidelities of the most aggressive Hyperband bracket.
+
+    Low to high, ending at ``1.0``. This is the ladder used by
+    :func:`successive_halving` (one closed cohort) and by
+    :func:`random_successive_halving` (open-ended early stopping).
+    """
+    brackets = hyperband_brackets(max_resource, eta, min_resource)
+    s, _n, r = brackets[0]
+    fidelities: List[float] = []
+    for i in range(s + 1):
+        r_i = min(float(max_resource), r * (eta**i))
+        fidelities.append(float(r_i) / float(max_resource))
+    return fidelities
+
+
+def select_halving_survivors(scores, eta: int = 3) -> List[int]:
+    """Indices successive halving would keep, best (lowest) score first.
+
+    Returns an empty list until at least ``eta`` scores have been observed,
+    so early stopping stays off while the rung is too small to rank. After
+    that, the best ``floor(n / eta)`` indices are kept (at least one). Ties
+    break toward the earlier index.
+    """
+    scores_arr = np.asarray(scores, dtype=float)
+    if scores_arr.ndim != 1:
+        raise ValueError("scores must be a 1-d array")
+    if isinstance(eta, bool) or int(eta) != eta or int(eta) < 2:
+        raise ValueError("eta must be an integer >= 2")
+    n = int(scores_arr.size)
+    n_keep = 0 if n < int(eta) else max(1, n // int(eta))
+    if n_keep <= 0:
+        return []
+    order = np.argsort(scores_arr, kind="mergesort")
+    return [int(i) for i in order[:n_keep]]
+
+
+@dataclass
+class _RungEntry:
+    """One configuration's completed evaluation at a single fidelity rung."""
+
+    config_id: int
+    params: Dict[str, Any]
+    score: float
+    promoted: bool = False
+
+
+def _next_survivor(entries: List[_RungEntry], eta: int) -> Optional[int]:
+    """Index of the best not-yet-promoted survivor, or ``None``."""
+    scores = [entry.score for entry in entries]
+    for idx in select_halving_survivors(scores, eta):
+        if not entries[idx].promoted:
+            return idx
+    return None
+
+
+def random_successive_halving(
+    space: Dict[str, Space],
+    objective: ScoreFn,
+    budget: int,
+    rng: Optional[np.random.Generator] = None,
+    stop_when: Stopper = None,
+    *,
+    eta: int = 3,
+    min_resource: int = 1,
+    max_resource: int = 9,
+) -> List[Trial]:
+    """Random search with successive-halving early stopping.
+
+    Configurations are drawn uniformly from ``space``, as in
+    :func:`random_search`. Each one starts at the cheapest fidelity on the
+    ladder from :func:`successive_halving_rungs` and is continued to the
+    next fidelity only when :func:`select_halving_survivors` still ranks it
+    among the best ``floor(n / eta)`` observations at its current rung.
+    Until a rung has ``eta`` observations, nobody is promoted. When nothing
+    is waiting for promotion, a fresh random configuration starts at the
+    bottom rung.
+
+    That is the successive-halving early-stopping rule on an open-ended
+    stream of random configurations (the synchronous form of ASHA; Li et
+    al., 2020), not a closed cohort. :func:`successive_halving` samples a
+    fixed bracket, evaluates the whole cohort, then discards the worst of
+    that cohort. Here the survivor set is the running top ``1/eta``, and a
+    configuration that was stopped can still be promoted later if later,
+    worse observations move it into that set.
+
+    Gaussian-process expected improvement is already implemented by
+    :class:`GaussianProcess`, :func:`expected_improvement` and
+    :func:`bayesian_search`. This searcher is the method added beside those,
+    rather than a second GP-EI optimizer.
+
+    ``budget`` counts objective evaluations, matching the other searchers.
+    Fidelity is a normalized ``resource`` in ``(0, 1]`` (``1.0`` = full
+    fidelity) when the objective accepts ``resource`` or ``fidelity``;
+    otherwise the objective is called with params only. With
+    ``max_resource == min_resource`` every evaluation is full fidelity and
+    the sampled configurations match :func:`random_search` on the same
+    generator.
+    """
+    _validate_space(space)
+    if budget < 1:
+        raise ValueError("budget must be >= 1")
+    _validate_hyperband_params(eta, min_resource, max_resource)
+    rng = rng if rng is not None else np.random.default_rng()
+    rungs = successive_halving_rungs(max_resource, eta, min_resource)
+    evaluate = _resource_caller(objective)
+    trials: List[Trial] = []
+    rung_entries: List[List[_RungEntry]] = [[] for _ in rungs]
+    next_id = 0
+
+    while len(trials) < budget:
+        chosen_id: Optional[int] = None
+        chosen_params: Optional[Dict[str, Any]] = None
+        rung_idx = 0
+        for candidate_rung in range(len(rungs) - 2, -1, -1):
+            survivor = _next_survivor(rung_entries[candidate_rung], eta)
+            if survivor is None:
+                continue
+            entry = rung_entries[candidate_rung][survivor]
+            entry.promoted = True
+            chosen_id = entry.config_id
+            chosen_params = dict(entry.params)
+            rung_idx = candidate_rung + 1
+            break
+        if chosen_params is None:
+            chosen_id = next_id
+            next_id += 1
+            chosen_params = _sample_config(space, rng)
+            rung_idx = 0
+        fidelity = float(rungs[rung_idx])
+        params = dict(chosen_params)
+        score = float(evaluate(dict(params), fidelity))
+        trials.append(Trial(len(trials), dict(params), score, resource=fidelity))
+        rung_entries[rung_idx].append(
+            _RungEntry(int(chosen_id), dict(params), score)
+        )
+        if stop_when is not None and stop_when(_best_score(trials), len(trials)):
             break
     return trials
 
