@@ -77,6 +77,7 @@ def test_available_strategies_lists_tpe_cmaes_hyperband_and_bohb():
         "hyperband",
         "bohb",
         "successive_halving",
+        "random_successive_halving",
     ]
 
 

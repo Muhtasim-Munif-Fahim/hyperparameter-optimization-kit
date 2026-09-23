@@ -90,7 +90,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="hyperopt-kit",
         description=(
             "Hyperparameter optimization toolkit: grid, random, bayesian, "
-            "TPE, CMA-ES, Hyperband / successive-halving, and BOHB search."
+            "TPE, CMA-ES, Hyperband / successive-halving, BOHB, and random "
+            "search with successive-halving early stopping."
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
@@ -127,7 +128,10 @@ def build_parser() -> argparse.ArgumentParser:
         )
         p.add_argument(
             "--eta", type=_eta, default=3,
-            help="Hyperband / successive-halving downsampling rate (integer >= 2)",
+            help=(
+                "downsampling rate for Hyperband, successive halving, and "
+                "random successive-halving (integer >= 2)"
+            ),
         )
         p.add_argument(
             "--min-resource", type=_positive_int, default=1,
@@ -203,6 +207,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             "max_resource": mf_kwargs["max_resource"],
         },
         "successive_halving": dict(mf_kwargs),
+        "random_successive_halving": {
+            "eta": mf_kwargs["eta"],
+            "min_resource": mf_kwargs["min_resource"],
+            "max_resource": mf_kwargs["max_resource"],
+        },
         "tpe": {"gamma": args.gamma},
         "cmaes": {"sigma0": args.sigma0},
         "bohb": {

@@ -15,6 +15,7 @@ from .searchers import (
     grid_search,
     hyperband_search,
     random_search,
+    random_successive_halving,
     successive_halving,
     tpe_search,
 )
@@ -29,6 +30,7 @@ _STRATEGIES = {
     "hyperband": hyperband_search,
     "bohb": bohb_search,
     "successive_halving": successive_halving,
+    "random_successive_halving": random_successive_halving,
 }
 
 _STRATEGY_KWARGS = {
@@ -50,6 +52,7 @@ _STRATEGY_KWARGS = {
         "min_bandwidth",
     ),
     "successive_halving": ("eta", "min_resource", "max_resource", "n_candidates"),
+    "random_successive_halving": ("eta", "min_resource", "max_resource"),
 }
 
 
