@@ -19,6 +19,9 @@ search is the method added beside it.
 ``bohb_search`` keeps that Hyperband schedule but proposes configurations
 from a multivariate product-kernel density of the best observations
 (Falkner, Klein, Hutter, 2018) instead of sampling them uniformly.
+``pbt_search`` trains a population in parallel and, every few resource
+rungs, copies weights and hyperparameters from better members into worse
+ones, then perturbs those hyperparameters (Jaderberg et al., 2017).
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ from __future__ import annotations
 import inspect
 import itertools
 import math
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -1919,3 +1923,399 @@ def cmaes_search(
             pending_scores = []
 
     return trials
+
+
+def _is_strict_int(value: Any) -> bool:
+    return isinstance(value, (int, np.integer)) and not isinstance(value, bool)
+
+
+def _is_real_number(value: Any) -> bool:
+    if isinstance(value, bool) or isinstance(value, (str, bytes)):
+        return False
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(number)
+
+
+def _validate_pbt_perturbation(
+    perturbation_factors: Tuple[float, ...],
+    resample_probability: float,
+) -> Tuple[float, ...]:
+    try:
+        factors = tuple(float(factor) for factor in perturbation_factors)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "perturbation_factors must be a non-empty sequence of positive finite numbers"
+        ) from exc
+    if len(factors) < 1 or any(not math.isfinite(factor) or factor <= 0.0 for factor in factors):
+        raise ValueError(
+            "perturbation_factors must be a non-empty sequence of positive finite numbers"
+        )
+    if (
+        not _is_real_number(resample_probability)
+        or not 0.0 <= float(resample_probability) <= 1.0
+    ):
+        raise ValueError("resample_probability must be in [0, 1]")
+    return factors
+
+
+def _validate_pbt_params(
+    population_size: Optional[int],
+    exploit_interval: int,
+    quantile: float,
+    perturbation_factors: Tuple[float, ...],
+    resample_probability: float,
+    eta: int,
+    min_resource: int,
+    max_resource: int,
+) -> Tuple[float, ...]:
+    if population_size is not None and (
+        not _is_strict_int(population_size) or int(population_size) < 2
+    ):
+        raise ValueError("population_size must be an integer >= 2")
+    if not _is_strict_int(exploit_interval) or int(exploit_interval) < 1:
+        raise ValueError("exploit_interval must be an integer >= 1")
+    if not _is_real_number(quantile) or not 0.0 < float(quantile) <= 0.5:
+        raise ValueError("quantile must be in (0, 0.5]")
+    factors = _validate_pbt_perturbation(perturbation_factors, resample_probability)
+    _validate_hyperband_params(eta, min_resource, max_resource)
+    return factors
+
+
+def pbt_perturb(
+    space: Dict[str, Space],
+    params: Dict[str, Any],
+    rng: np.random.Generator,
+    *,
+    perturbation_factors: Tuple[float, ...] = (0.8, 1.2),
+    resample_probability: float = 0.25,
+) -> Dict[str, Any]:
+    """Perturb one configuration (the PBT explore step).
+
+    Each continuous or integer parameter is multiplied by a factor drawn
+    from ``perturbation_factors`` and clipped to its bounds (Jaderberg et
+    al., 2017). If that product does not move a non-degenerate integer, or
+    a float already sitting on the boundary, a one-step
+    :meth:`Space.mutate` is applied so explore is not a no-op. Each
+    categorical parameter is redrawn from the other choices with
+    probability ``resample_probability``. The input mapping is not mutated.
+    """
+    _validate_space(space)
+    factors = _validate_pbt_perturbation(perturbation_factors, resample_probability)
+    if not isinstance(rng, np.random.Generator):
+        raise ValueError("rng must be a numpy Generator")
+    missing = [name for name in space if name not in params]
+    if missing:
+        raise ValueError(f"params missing keys: {missing}")
+
+    perturbed = dict(params)
+    factor_array = np.asarray(factors, dtype=float)
+    for name, sp in space.items():
+        if isinstance(sp, Categorical):
+            if len(sp.choices) > 1 and float(resample_probability) > 0.0:
+                if float(rng.random()) < float(resample_probability):
+                    choices = [choice for choice in sp.choices if choice != params[name]]
+                    perturbed[name] = choices[int(rng.integers(0, len(choices)))]
+            continue
+        factor = float(rng.choice(factor_array))
+        if isinstance(sp, FloatRange):
+            current = float(params[name])
+            value = float(np.clip(current * factor, sp.low, sp.high))
+            if (
+                abs(value - current) <= 1e-15
+                and abs(factor - 1.0) > 1e-12
+                and not sp.degenerate
+            ):
+                value = float(sp.mutate(current, rng))
+            perturbed[name] = value
+        elif isinstance(sp, IntRange):
+            current = int(params[name])
+            value = int(np.clip(int(round(current * factor)), sp.low, sp.high))
+            if value == current and sp.n_values > 1 and abs(factor - 1.0) > 1e-12:
+                value = int(sp.mutate(current, rng))
+            perturbed[name] = value
+        else:
+            raise TypeError(f"unsupported space type {type(sp).__name__}")
+    return perturbed
+
+
+def _interpret_pbt_result(result: Any) -> Tuple[float, Any, bool]:
+    """Return ``(score, weights, explicit)``.
+
+    A ``(score, weights)`` tuple is an explicit checkpoint. Any other real
+    number is a scalar score and the searcher keeps its own checkpoint.
+    """
+    if isinstance(result, tuple) and len(result) == 2 and _is_real_number(result[0]):
+        return float(result[0]), result[1], True
+    if not _is_real_number(result):
+        raise TypeError("PBT objective must return a float score, or (score, weights)")
+    return float(result), None, False
+
+
+def _pbt_caller(
+    objective: ScoreFn,
+) -> Callable[[Dict[str, Any], float, Any], Tuple[float, Any, bool]]:
+    """Adapt ``objective(params)``, ``(..., resource=)`` and ``(..., weights=)``."""
+    try:
+        signature = inspect.signature(objective)
+    except (TypeError, ValueError):
+
+        def _bare(params: Dict[str, Any], resource: float, weights: Any):
+            return _interpret_pbt_result(objective(params))
+
+        return _bare
+
+    parameters = signature.parameters
+    has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+    names = set(parameters)
+    positional = [
+        p
+        for p in parameters.values()
+        if p.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+
+    def _call(params: Dict[str, Any], resource: float, weights: Any):
+        kwargs: Dict[str, Any] = {}
+        if has_var_kw or "resource" in names:
+            kwargs["resource"] = resource
+        elif "fidelity" in names:
+            kwargs["fidelity"] = resource
+        elif len(positional) >= 2 and positional[1].name not in ("weights", "checkpoint"):
+            kwargs[positional[1].name] = resource
+        if has_var_kw or "weights" in names:
+            kwargs["weights"] = weights
+        elif "checkpoint" in names:
+            kwargs["checkpoint"] = weights
+        elif len(positional) >= 3:
+            kwargs[positional[2].name] = weights
+        return _interpret_pbt_result(objective(params, **kwargs))
+
+    return _call
+
+
+@dataclass
+class _PBTMember:
+    """One member of a population-based training population."""
+
+    params: Dict[str, Any]
+    weights: Any = None
+    score: float = float("inf")
+    rung: int = -1
+    eval_count: int = 0
+
+
+def _pbt_generation_ready(members: List[_PBTMember], exploit_interval: int) -> bool:
+    """True when every member has just finished a synchronous exploit step."""
+    counts = [member.eval_count for member in members]
+    if not counts or any(count <= 0 for count in counts):
+        return False
+    if any(count != counts[0] for count in counts):
+        return False
+    return counts[0] % int(exploit_interval) == 0
+
+
+def _pbt_exploit_explore(
+    members: List[_PBTMember],
+    space: Dict[str, Space],
+    rng: np.random.Generator,
+    quantile: float,
+    perturbation_factors: Tuple[float, ...],
+    resample_probability: float,
+) -> None:
+    """Truncation selection: copy elites into the bottom quantile, then perturb.
+
+    The bottom ``floor(quantile * n)`` members (at least one, and at most
+    half the population) each copy weights, hyperparameters, score and rung
+    from a uniformly chosen member of the matching top quantile. Explore
+    then perturbs only the copied hyperparameters.
+    """
+    n = len(members)
+    cutoff = max(1, int(math.floor(float(quantile) * n)))
+    cutoff = min(cutoff, n // 2)
+    if cutoff < 1:
+        return
+    order = sorted(range(n), key=lambda i: (members[i].score, i))
+    elites = order[:cutoff]
+    for idx in order[-cutoff:]:
+        donor = members[int(elites[int(rng.integers(0, len(elites)))])]
+        child = members[idx]
+        child.params = pbt_perturb(
+            space,
+            deepcopy(donor.params),
+            rng,
+            perturbation_factors=perturbation_factors,
+            resample_probability=resample_probability,
+        )
+        child.weights = deepcopy(donor.weights)
+        child.score = float(donor.score)
+        child.rung = int(donor.rung)
+
+
+def pbt_best_trial(trials: List[Trial]) -> Trial:
+    """Lowest-score trial in a PBT history.
+
+    When trials record ``resource``, the winner is chosen among the
+    highest-resource evaluations, matching
+    :func:`hyperopt_kit.evaluate.best_trial`, so a lucky cheap rung cannot
+    beat a full-fidelity score.
+    """
+    if len(trials) == 0:
+        raise ValueError("no trials available")
+    resources = [
+        trial.resource for trial in trials if getattr(trial, "resource", None) is not None
+    ]
+    if resources:
+        r_max = max(resources)
+        candidates = [
+            trial
+            for trial in trials
+            if getattr(trial, "resource", None) is not None
+            and trial.resource >= r_max - 1e-12
+        ]
+        if candidates:
+            return min(candidates, key=lambda trial: trial.score)
+    return min(trials, key=lambda trial: trial.score)
+
+
+class PBTHistory(list):
+    """Evaluation history returned by :func:`pbt_search`.
+
+    The list itself is every :class:`Trial` in evaluation order. ``best``
+    is the trial :func:`pbt_best_trial` would pick from that history.
+    """
+
+    @property
+    def best(self) -> Trial:
+        return pbt_best_trial(self)
+
+    @property
+    def history(self) -> List[Trial]:
+        return list(self)
+
+
+def _pbt_checkpoint(params: Dict[str, Any], resource: float, step: int, parent: Any) -> Dict[str, Any]:
+    """Checkpoint stored when the objective returns a scalar score."""
+    return {
+        "params": deepcopy(params),
+        "resource": float(resource),
+        "step": int(step),
+        "parent": parent,
+    }
+
+
+def pbt_search(
+    space: Dict[str, Space],
+    objective: ScoreFn,
+    budget: int,
+    rng: Optional[np.random.Generator] = None,
+    stop_when: Stopper = None,
+    *,
+    population_size: Optional[int] = None,
+    exploit_interval: int = 1,
+    quantile: float = 0.25,
+    perturbation_factors: Tuple[float, ...] = (0.8, 1.2),
+    resample_probability: float = 0.25,
+    eta: int = 3,
+    min_resource: int = 1,
+    max_resource: int = 9,
+) -> PBTHistory:
+    """Population-Based Training (Jaderberg et al., 2017).
+
+    A population of configurations is sampled from ``space`` and stepped
+    together along the fidelity ladder from :func:`successive_halving_rungs`.
+    Each objective call is one resource rung (a normalized ``resource`` in
+    ``(0, 1]``, ``1.0`` at full fidelity). After the last rung, later steps
+    stay at full fidelity so training can continue. ``budget`` counts
+    objective calls, matching :func:`tpe_search`, :func:`bohb_search` and
+    :func:`cmaes_search`.
+
+    Every ``exploit_interval`` completed generations, truncation selection
+    replaces the worst ``quantile`` fraction of the population. Each
+    replaced member copies the donor's weights and hyperparameters (and the
+    donor's rung, since those weights have already been trained that far),
+    then :func:`pbt_perturb` explores by perturbing continuous, integer and
+    categorical dimensions. Members are evaluated in population order, so
+    trial ``t`` belongs to member ``t % population_size``.
+
+    The objective may return a float, or ``(score, weights)`` to own the
+    checkpoint that exploit copies. Checkpoints are passed back as
+    ``weights`` (or ``checkpoint``) when the callable accepts that argument;
+    ``resource`` / ``fidelity`` is passed the same way as
+    :func:`hyperband_search`. A scalar return is stored as a checkpoint of
+    the params, resource and step so exploit still has weights to copy.
+    A one-argument ``objective(params)`` remains valid.
+
+    ``population_size`` defaults to 4 (or to the budget, when the budget is
+    smaller, but never below 2). ``perturbation_factors`` defaults to
+    ``(0.8, 1.2)``. ``quantile`` is the truncation fraction in ``(0, 0.5]``.
+
+    Returns a :class:`PBTHistory`: the list is the full history, and
+    ``history.best`` is the best trial (lowest score at the highest
+    resource).
+    """
+    _validate_space(space)
+    if budget < 1:
+        raise ValueError("budget must be >= 1")
+    factors = _validate_pbt_params(
+        population_size,
+        exploit_interval,
+        quantile,
+        perturbation_factors,
+        resample_probability,
+        eta,
+        min_resource,
+        max_resource,
+    )
+    rng = rng if rng is not None else np.random.default_rng()
+    if population_size is None:
+        size = 4 if budget >= 4 else max(2, int(budget))
+    else:
+        size = int(population_size)
+
+    rungs = successive_halving_rungs(max_resource, eta, min_resource)
+    evaluate = _pbt_caller(objective)
+    members = [_PBTMember(params=_sample_config(space, rng)) for _ in range(size)]
+    trials = PBTHistory()
+    best = float("inf")
+
+    while len(trials) < budget:
+        progressed = False
+        for member in members:
+            if len(trials) >= budget:
+                break
+            next_rung = min(member.rung + 1, len(rungs) - 1)
+            fidelity = float(rungs[next_rung])
+            params = dict(member.params)
+            score, returned, explicit = evaluate(params, fidelity, member.weights)
+            member.eval_count += 1
+            member.rung = next_rung
+            member.score = float(score)
+            if explicit:
+                member.weights = returned
+            else:
+                member.weights = _pbt_checkpoint(
+                    params, fidelity, member.eval_count, member.weights
+                )
+            trials.append(Trial(len(trials), dict(params), float(score), resource=fidelity))
+            best = min(best, float(score))
+            progressed = True
+            if stop_when is not None and stop_when(best, len(trials)):
+                return trials
+        if not progressed:
+            break
+        if _pbt_generation_ready(members, exploit_interval):
+            _pbt_exploit_explore(
+                members,
+                space,
+                rng,
+                float(quantile),
+                factors,
+                float(resample_probability),
+            )
+    return trials
+
+
+population_based_training = pbt_search

@@ -161,6 +161,30 @@ def test_search_bohb_subcommand(capsys):
     assert "trials: 10" in out
 
 
+def test_search_pbt_subcommand(capsys):
+    rc = main(
+        ["search", "--space", SPACE, "--objective", "demo", "--budget", "8",
+         "--strategy", "pbt", "--seed", "2", "--population-size", "4",
+         "--exploit-interval", "1", "--eta", "3", "--max-resource", "9"]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "strategy: pbt" in out
+    assert "trials: 8" in out
+
+
+def test_compare_pbt_only(capsys):
+    rc = main(
+        ["compare", "--space", SPACE, "--objective", "demo", "--budget", "8",
+         "--seed", "3", "--strategies", "random,pbt", "--exploit-interval", "1"]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "| random |" in out
+    assert "| pbt |" in out
+    assert "| grid |" not in out
+
+
 def test_search_cmaes_subcommand(capsys):
     rc = main(
         ["search", "--space", SPACE, "--objective", "demo", "--budget", "10",
