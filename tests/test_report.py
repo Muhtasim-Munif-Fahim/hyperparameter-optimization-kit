@@ -145,6 +145,13 @@ def test_write_report_creates_parent_directories(tmp_path):
     assert out.read_text(encoding="utf-8") == "# hi\n"
 
 
+def test_render_report_mentions_pbt():
+    space = parse_space({"x": [0.0, 1.0]})
+    text = render_report(_comparison(space), space)
+    assert "Population-based training" in text
+    assert "weights and hyperparameters" in text
+
+
 def test_render_report_mentions_tpe_cmaes_hyperband_and_bohb_caveats():
     space = parse_space({"x": [0.0, 1.0]})
     text = render_report(_comparison(space), space)

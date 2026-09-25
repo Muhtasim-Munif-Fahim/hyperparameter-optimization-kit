@@ -198,6 +198,13 @@ def render_report(
         "rung so a lucky cheap evaluation cannot win the comparison."
     )
     lines.append(
+        "- Population-based training keeps a population of configurations. "
+        "After each resource rung it copies weights and hyperparameters from "
+        "better members into worse ones, then perturbs continuous, integer "
+        "and categorical dimensions. Reported best scores use the "
+        "highest-resource rung."
+    )
+    lines.append(
         "- BOHB uses the same successive-halving brackets as Hyperband, but "
         "proposes new configurations from a multivariate product kernel fit "
         "to the best observations at the largest fidelity with enough data. "

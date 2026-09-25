@@ -90,8 +90,9 @@ def build_parser() -> argparse.ArgumentParser:
         prog="hyperopt-kit",
         description=(
             "Hyperparameter optimization toolkit: grid, random, bayesian, "
-            "TPE, CMA-ES, Hyperband / successive-halving, BOHB, and random "
-            "search with successive-halving early stopping."
+            "TPE, CMA-ES, population-based training, Hyperband / "
+            "successive-halving, BOHB, and random search with "
+            "successive-halving early stopping."
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
@@ -120,7 +121,10 @@ def build_parser() -> argparse.ArgumentParser:
         )
         p.add_argument(
             "--population-size", type=_population_size, default=None,
-            help="CMA-ES offspring per generation (default: 4 + floor(3 log n))",
+            help=(
+                "CMA-ES offspring per generation (default: 4 + floor(3 log n)), "
+                "or PBT population size (default: 4)"
+            ),
         )
         p.add_argument(
             "--sigma0", type=float, default=0.3,
@@ -129,8 +133,8 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument(
             "--eta", type=_eta, default=3,
             help=(
-                "downsampling rate for Hyperband, successive halving, and "
-                "random successive-halving (integer >= 2)"
+                "downsampling rate for Hyperband, successive halving, "
+                "random successive-halving, and PBT rungs (integer >= 2)"
             ),
         )
         p.add_argument(
@@ -148,6 +152,10 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument(
             "--random-fraction", type=_unit_fraction, default=1.0 / 3.0,
             help="BOHB: fraction of proposals drawn uniformly instead of from the KDE",
+        )
+        p.add_argument(
+            "--exploit-interval", type=_positive_int, default=1,
+            help="PBT: completed population steps between exploit and explore",
         )
 
     p_search = sub.add_parser("search", help="run a single search strategy")
@@ -221,9 +229,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             "top_n_percent": args.top_n_percent,
             "random_fraction": args.random_fraction,
         },
+        "pbt": {
+            "eta": mf_kwargs["eta"],
+            "min_resource": mf_kwargs["min_resource"],
+            "max_resource": mf_kwargs["max_resource"],
+            "exploit_interval": args.exploit_interval,
+        },
     }
     if args.population_size is not None:
         strategy_kwargs["cmaes"]["population_size"] = args.population_size
+        strategy_kwargs["pbt"]["population_size"] = args.population_size
 
     if args.command == "search":
         extra = {
@@ -236,6 +251,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "max_resource": mf_kwargs["max_resource"],
             "top_n_percent": args.top_n_percent,
             "random_fraction": args.random_fraction,
+            "exploit_interval": args.exploit_interval,
         }
         if args.population_size is not None:
             extra["population_size"] = args.population_size

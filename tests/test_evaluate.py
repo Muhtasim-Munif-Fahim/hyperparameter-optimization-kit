@@ -74,6 +74,7 @@ def test_available_strategies_lists_tpe_cmaes_hyperband_and_bohb():
         "bayesian",
         "tpe",
         "cmaes",
+        "pbt",
         "hyperband",
         "bohb",
         "successive_halving",

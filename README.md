@@ -4,8 +4,9 @@ A small, dependency-light toolkit for hyperparameter and configuration search
 over machine-learning models, built on pure Python and numpy. It ships grid
 search, random search, a Gaussian-process bayesian optimizer with
 expected-improvement acquisition, Tree-structured Parzen Estimator (TPE)
-search, CMA-ES (covariance-matrix adaptation), Hyperband / successive
-halving, BOHB (Bayesian Optimization Hyperband), and random search with
+search, CMA-ES (covariance-matrix adaptation), population-based training
+(PBT), Hyperband / successive halving, BOHB (Bayesian Optimization
+Hyperband), and random search with
 successive-halving early stopping — plus utilities for comparing strategies
 on a common evaluation budget and rendering markdown reports of the results.
 
@@ -34,6 +35,11 @@ fidelity rung.
   adapted from the ranked offspring. Designed for `FloatRange` /
   `IntRange` (including log-scaled ranges); categoricals are encoded as
   ordered coordinates.
+- **Population-based training** (`pbt_search`): a population of
+  configurations stepped along fidelity rungs. Every few steps the worst
+  members copy a better member's weights and hyperparameters, then those
+  hyperparameters are perturbed (continuous and integer factors, categorical
+  resample). NumPy only.
 - **Hyperband / successive-halving** (`hyperopt_kit.searchers`): multi-fidelity
   brackets that evaluate many configurations at a cheap resource, discard the
   worst, and promote survivors to higher fidelity. Objectives may accept a
@@ -98,10 +104,13 @@ write_report(render_report(results, space, objective_name="toy"), "report.md")
 ```
 
 Single strategies are available directly: `grid_search`, `random_search`,
-`bayesian_search`, `tpe_search`, `cmaes_search`, `hyperband_search`,
-`bohb_search`, `successive_halving` and `random_successive_halving` each
-return a list of `Trial`s (`iteration`, `params`, `score`, optional
-`resource`), and `run_search` wraps one of them with early-stopping support.
+`bayesian_search`, `tpe_search`, `cmaes_search`, `pbt_search`,
+`hyperband_search`, `bohb_search`, `successive_halving` and
+`random_successive_halving` each return a list of `Trial`s (`iteration`,
+`params`, `score`, optional `resource`). `pbt_search` (also
+`population_based_training`) returns that history as a list with a `best`
+trial (lowest score at the highest resource). `run_search` wraps one of
+them with early-stopping support.
 
 ## CLI
 
@@ -110,6 +119,11 @@ return a list of `Trial`s (`iteration`, `params`, `score`, optional
 python -m hyperopt_kit.cli search \
   --space '{"learning_rate": [0.001, 1.0, "log"], "units": [16, 256, "int"]}' \
   --objective demo --budget 30 --strategy cmaes --seed 7
+
+# population-based training
+python -m hyperopt_kit.cli search \
+  --space '{"learning_rate": [0.001, 1.0, "log"], "units": [16, 256, "int"]}' \
+  --objective demo --budget 30 --strategy pbt --population-size 4 --seed 7
 
 # compare strategies on a common budget
 python -m hyperopt_kit.cli compare --space '{"a": [0.1, 5.0], "b": [0.1, 5.0]}' \
@@ -123,7 +137,7 @@ python -m hyperopt_kit.cli report --space '{"a": [0.1, 5.0], "b": [0.1, 5.0]}' \
 `--objective` accepts the built-in `demo` objective or any `module:function`
 path. `--space` accepts inline JSON or `@path/to/space.json`. Multi-fidelity
 flags `--eta`, `--min-resource` and `--max-resource` apply to `hyperband`,
-`successive_halving`, `random_successive_halving` and `bohb`. `--gamma` is
+`successive_halving`, `random_successive_halving`, `bohb` and `pbt`. `--gamma` is
 the TPE quantile (fraction of observations modeled by `l(x)`); `--n-initial`
 and `--n-candidates` apply to
 TPE and bayesian search, and `--n-candidates` also sets the BOHB candidate
@@ -131,7 +145,11 @@ pool (default 64). `--population-size` and `--sigma0` configure CMA-ES
 (Hansen's `4 + floor(3 log n)` offspring and unit-cube step-size `0.3` by
 default). `--top-n-percent` (default 15) is the BOHB good-set percentage and
 `--random-fraction` (default 1/3) is the share of BOHB proposals drawn
-uniformly instead of from the kernel density.
+uniformly instead of from the kernel density. `--population-size` also sets
+the PBT population (default 4), and `--exploit-interval` (default 1) is how
+many completed PBT steps pass between exploit and explore.
+`--strategy pbt` runs population-based training; it is registered for
+`--strategies` and left out of the default comparison set.
 
 ## Search strategies
 
@@ -142,6 +160,7 @@ uniformly instead of from the kernel density.
 | `bayesian` | GP surrogate on normalized inputs + expected improvement | sample-efficient on smooth objectives | fragile with nominal categoricals and non-smooth surfaces |
 | `tpe` | Parzen densities `l(x)` / `g(x)` on good vs bad observations; next point maximizes `l/g` | handles mixed numeric/categorical spaces; numpy-only | factorized per parameter, so it misses interactions |
 | `cmaes` | sample `N(m, σ²C)` in normalized space; adapt mean, step-size and covariance from ranked offspring | models parameter interactions via `C`; strong on smooth continuous / integer ranges | not a natural fit for nominal categoricals; needs a few generations to adapt |
+| `pbt` | population stepped on fidelity rungs; worst members copy a better member's weights and hyperparameters, then perturb them | online adaptation of a small population; uses partial training instead of restarting | needs a population of at least 2 and a few exploit steps; not in the default comparison set |
 | `hyperband` | several successive-halving brackets with different `(n, r)` allocations | cheap fidelities discard losers early | needs a fidelity-aware objective to save real work; ranking can change across rungs |
 | `bohb` | Hyperband schedule, but new configs maximize `l(x)/g(x)` under a product-kernel density of the best observations at the largest usable fidelity | multi-fidelity sample efficiency; the joint kernel can express interactions that factorized TPE misses | model is idle until both good and bad sets have more points than the dimension; still needs a fidelity-aware objective |
 | `successive_halving` | one Hyperband bracket (aggressive early-stop), repeated to fill the budget | simpler than full Hyperband | same fidelity caveats; fewer full-fidelity evaluations |
@@ -151,14 +170,14 @@ uniformly instead of from the kernel density.
 evaluation budget across `grid`, `random`, `bayesian`, `tpe`, `cmaes`,
 `hyperband` and `bohb` by default. `random_successive_halving` is registered
 for `--strategy` / `--strategies` and is left out of that default set, same
-as `successive_halving`. Each Hyperband, BOHB, or early-stopping random
+as `successive_halving` and `pbt`. Each Hyperband, BOHB, PBT, or early-stopping random
 evaluation counts as one trial, matching the other searchers; reported
 winners use the highest-resource score so a noisy cheap rung cannot beat a
 full-fidelity result.
 
 ## Multi-fidelity objectives
 
-Hyperband, successive halving, random successive-halving and BOHB call
+Hyperband, successive halving, random successive-halving, BOHB and PBT call
 `objective(params, resource=r)` when the callable accepts
 `resource` or `fidelity` (a float in `(0, 1]`, where `1.0` is full fidelity).
 A one-argument `objective(params)` is still valid — every rung then sees the
@@ -241,6 +260,17 @@ prints the best scores and a learning-curve table, and writes
   random_successive_halving` or `strategies=("random_successive_halving",)`);
   it is not in the default comparison set. GP-EI was already available, so
   this is the method added in its place.
+- Population-based training (`pbt_search` /
+  `population_based_training`, Jaderberg et al., 2017) keeps a population
+  (default 4) and advances every member one fidelity rung per step. Every
+  `exploit_interval` completed generations (default 1), the worst
+  `quantile` fraction (default 0.25) copies weights and hyperparameters
+  from a uniformly chosen member of the best fraction, then multiplies
+  continuous and integer values by `0.8` or `1.2` and resamples categoricals
+  with probability 0.25. Return `(score, weights)` to own the checkpoint
+  exploit copies; a float score still stores a params/resource/step
+  checkpoint. Pass it explicitly (`--strategy pbt` or
+  `strategies=("pbt",)`); it is not in the default comparison set.
 - BOHB (Falkner, Klein, Hutter, 2018) keeps that schedule and replaces
   uniform sampling with a product-kernel density estimator. The kernel is
   the product of per-coordinate factors centered on each joint observation
