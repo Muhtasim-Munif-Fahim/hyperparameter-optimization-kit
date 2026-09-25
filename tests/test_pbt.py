@@ -56,21 +56,34 @@ def test_pbt_perturb_scales_float_and_int_and_resamples_categorical():
 
 def test_pbt_perturb_clips_to_bounds_and_keeps_identity_factor():
     space = parse_space({"x": [0.1, 1.0], "n": [2, 8, "int"], "k": ["a", "b"]})
-    params = {"x": 0.1, "n": 4, "k": "a"}
-    clipped = pbt_perturb(
+    interior = {"x": 0.4, "n": 4, "k": "a"}
+    scaled = pbt_perturb(
         space,
-        params,
+        interior,
         np.random.default_rng(1),
         perturbation_factors=(0.5,),
         resample_probability=0.0,
     )
-    assert clipped["x"] == pytest.approx(0.1)
-    assert clipped["n"] == 2
-    assert clipped["k"] == "a"
+    assert scaled["x"] == pytest.approx(0.2)
+    assert scaled["n"] == 2
+    assert scaled["k"] == "a"
+
+    on_bound = {"x": 0.1, "n": 4, "k": "a"}
+    moved = pbt_perturb(
+        space,
+        on_bound,
+        np.random.default_rng(1),
+        perturbation_factors=(0.5,),
+        resample_probability=0.0,
+    )
+    # 0.1 * 0.5 clips back to the bound, so explore takes one mutate step.
+    assert 0.1 < moved["x"] <= 1.0
+    assert moved["n"] == 2
+    assert moved["k"] == "a"
 
     same = pbt_perturb(
         space,
-        params,
+        on_bound,
         np.random.default_rng(1),
         perturbation_factors=(1.0,),
         resample_probability=0.0,
