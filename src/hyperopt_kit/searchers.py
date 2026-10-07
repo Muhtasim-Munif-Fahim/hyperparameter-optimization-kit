@@ -22,6 +22,7 @@ from a multivariate product-kernel density of the best observations
 ``pbt_search`` trains a population in parallel and, every few resource
 rungs, copies weights and hyperparameters from better members into worse
 ones, then perturbs those hyperparameters (Jaderberg et al., 2017).
+``differential_evolution_search`` runs classic DE/rand/1/bin (and related strategies) on the normalized unit cube (Storn & Price, 1997).
 """
 
 from __future__ import annotations
@@ -1923,6 +1924,180 @@ def cmaes_search(
             pending_scores = []
 
     return trials
+
+
+def _validate_de_params(
+    population_size: Optional[int],
+    mutation: float,
+    crossover: float,
+    strategy: str,
+) -> str:
+    """Validate DE hyperparameters; return the canonical strategy name."""
+    if population_size is not None:
+        if not isinstance(population_size, (int, np.integer)) or int(population_size) < 4:
+            raise ValueError("population_size must be an integer >= 4")
+    if not np.isfinite(mutation) or mutation <= 0.0:
+        raise ValueError("mutation (F) must be a positive finite number")
+    if not np.isfinite(crossover) or not (0.0 <= crossover <= 1.0):
+        raise ValueError("crossover (CR) must lie in [0, 1]")
+    name = str(strategy).strip().lower()
+    allowed = {"rand/1/bin", "best/1/bin", "rand/2/bin"}
+    if name not in allowed:
+        raise ValueError(
+            f"strategy must be one of {sorted(allowed)}, got {strategy!r}"
+        )
+    return name
+
+
+def de_mutant(
+    population: np.ndarray,
+    index: int,
+    rng: np.random.Generator,
+    *,
+    mutation: float = 0.8,
+    strategy: str = "rand/1/bin",
+    best_index: Optional[int] = None,
+) -> np.ndarray:
+    """Build a DE donor vector for member ``index`` (unit-cube population).
+
+    Strategies follow Storn & Price (1997):
+    ``rand/1`` = ``a + F (b - c)``, ``best/1`` = ``best + F (b - c)``,
+    ``rand/2`` = ``a + F (b - c) + F (d - e)``. Indices are drawn without
+    replacement from the remaining population.
+    """
+    pop = np.asarray(population, dtype=float)
+    if pop.ndim != 2:
+        raise ValueError("population must be a 2-d array")
+    n_pop, n_dim = pop.shape
+    if n_pop < 4:
+        raise ValueError("population needs at least 4 members")
+    if not (0 <= index < n_pop):
+        raise ValueError("index out of range")
+    strategy = _validate_de_params(None, mutation, 0.5, strategy)
+    others = [i for i in range(n_pop) if i != index]
+    if strategy == "rand/1/bin":
+        a, b, c = (int(i) for i in rng.choice(others, size=3, replace=False))
+        donor = pop[a] + mutation * (pop[b] - pop[c])
+    elif strategy == "best/1/bin":
+        if best_index is None:
+            raise ValueError("best_index is required for best/1/bin")
+        b, c = (int(i) for i in rng.choice(others, size=2, replace=False))
+        donor = pop[int(best_index)] + mutation * (pop[b] - pop[c])
+    else:  # rand/2/bin
+        if n_pop < 6:
+            raise ValueError("rand/2/bin needs a population of at least 6")
+        a, b, c, d, e = (int(i) for i in rng.choice(others, size=5, replace=False))
+        donor = pop[a] + mutation * (pop[b] - pop[c]) + mutation * (pop[d] - pop[e])
+    return np.clip(donor, 0.0, 1.0)
+
+
+def de_crossover(
+    target: np.ndarray,
+    donor: np.ndarray,
+    rng: np.random.Generator,
+    *,
+    crossover: float = 0.9,
+) -> np.ndarray:
+    """Binomial crossover: inherit from ``donor`` with probability ``CR``.
+
+    At least one coordinate is always taken from ``donor`` (classic DE/bin).
+    """
+    target = np.asarray(target, dtype=float).reshape(-1)
+    donor = np.asarray(donor, dtype=float).reshape(-1)
+    if target.shape != donor.shape:
+        raise ValueError("target and donor must have the same shape")
+    if not np.isfinite(crossover) or not (0.0 <= crossover <= 1.0):
+        raise ValueError("crossover (CR) must lie in [0, 1]")
+    n = target.size
+    mask = rng.random(n) < crossover
+    force = int(rng.integers(n))
+    mask[force] = True
+    trial = np.where(mask, donor, target)
+    return np.clip(trial, 0.0, 1.0)
+
+
+def differential_evolution_search(
+    space: Dict[str, Space],
+    objective: ScoreFn,
+    budget: int,
+    rng: Optional[np.random.Generator] = None,
+    stop_when: Stopper = None,
+    *,
+    population_size: Optional[int] = None,
+    mutation: float = 0.8,
+    crossover: float = 0.9,
+    strategy: str = "rand/1/bin",
+) -> List[Trial]:
+    """Differential Evolution (Storn & Price, 1997) on the unit cube.
+
+    Each generation mutates population members into donor vectors, applies
+    binomial crossover, and greedily replaces a parent when the trial scores
+    lower (minimize). Search runs in the normalized coordinates of each
+    :class:`Space` (same encoding as CMA-ES), so ``FloatRange`` /
+    ``IntRange`` / log-scaled ranges and categoricals are all supported.
+
+    ``budget`` counts objective evaluations. ``population_size`` defaults to
+    ``max(4, min(10 * n_dim, budget))``. Supported strategies:
+    ``rand/1/bin``, ``best/1/bin``, ``rand/2/bin``.
+    """
+    _validate_space(space)
+    if budget < 1:
+        raise ValueError("budget must be >= 1")
+    strategy = _validate_de_params(population_size, mutation, crossover, strategy)
+    rng = rng if rng is not None else np.random.default_rng()
+    names = list(space)
+    n_dim = len(names)
+    if population_size is None:
+        size = max(4, min(10 * n_dim, int(budget)))
+    else:
+        size = int(population_size)
+    if strategy == "rand/2/bin" and size < 6:
+        raise ValueError("rand/2/bin needs population_size >= 6")
+    size = min(size, int(budget))
+    if size < 4:
+        raise ValueError("budget must be at least 4 for differential evolution")
+
+    # Initialize population uniformly on the unit cube and evaluate.
+    population = rng.random((size, n_dim))
+    scores = np.empty(size, dtype=float)
+    trials: List[Trial] = []
+    best = float("inf")
+    for i in range(size):
+        config = _decode_cmaes_vector(population[i], names, space)
+        score = float(objective(config))
+        scores[i] = score
+        trials.append(Trial(len(trials), config, score))
+        best = min(best, score)
+        if stop_when is not None and stop_when(best, len(trials)):
+            return trials
+
+    while len(trials) < budget:
+        for i in range(size):
+            if len(trials) >= budget:
+                break
+            best_index = int(np.argmin(scores))
+            donor = de_mutant(
+                population,
+                i,
+                rng,
+                mutation=mutation,
+                strategy=strategy,
+                best_index=best_index,
+            )
+            child = de_crossover(population[i], donor, rng, crossover=crossover)
+            config = _decode_cmaes_vector(child, names, space)
+            score = float(objective(config))
+            trials.append(Trial(len(trials), config, score))
+            best = min(best, score)
+            if score <= scores[i]:
+                population[i] = child
+                scores[i] = score
+            if stop_when is not None and stop_when(best, len(trials)):
+                return trials
+    return trials
+
+
+de_search = differential_evolution_search
 
 
 def _is_strict_int(value: Any) -> bool:
