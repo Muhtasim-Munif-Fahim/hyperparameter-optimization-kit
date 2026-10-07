@@ -7,7 +7,7 @@ expected-improvement acquisition, Tree-structured Parzen Estimator (TPE)
 search, CMA-ES (covariance-matrix adaptation), population-based training
 (PBT), Hyperband / successive halving, BOHB (Bayesian Optimization
 Hyperband), and random search with
-successive-halving early stopping — plus utilities for comparing strategies
+successive-halving early stopping, and Differential Evolution — plus utilities for comparing strategies
 on a common evaluation budget and rendering markdown reports of the results.
 
 Gaussian-process expected improvement is already in the toolkit
@@ -35,6 +35,7 @@ fidelity rung.
   adapted from the ranked offspring. Designed for `FloatRange` /
   `IntRange` (including log-scaled ranges); categoricals are encoded as
   ordered coordinates.
+- **Differential Evolution** (`differential_evolution_search` / `de_search`): classic DE/rand/1/bin (also best/1/bin and rand/2/bin) on the normalized unit cube (Storn & Price, 1997). Mutation and binomial crossover produce trial vectors that greedily replace parents. NumPy only.
 - **Population-based training** (`pbt_search`): a population of
   configurations stepped along fidelity rungs. Every few steps the worst
   members copy a better member's weights and hyperparameters, then those
