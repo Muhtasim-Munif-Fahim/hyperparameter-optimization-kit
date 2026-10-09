@@ -2100,6 +2100,114 @@ def differential_evolution_search(
 de_search = differential_evolution_search
 
 
+def particle_swarm_search(
+    space: Dict[str, Space],
+    objective: ScoreFn,
+    budget: int,
+    rng: Optional[np.random.Generator] = None,
+    stop_when: Stopper = None,
+    *,
+    swarm_size: Optional[int] = None,
+    inertia: float = 0.729,
+    cognitive: float = 1.49445,
+    social: float = 1.49445,
+    vmax: float = 0.2,
+) -> List[Trial]:
+    """Particle Swarm Optimization (Kennedy & Eberhart, 1995) on the unit cube.
+
+    Each particle keeps a position and velocity in the normalized
+    coordinates of :class:`Space` (same encoding as CMA-ES / DE). The
+    classical inertia / cognitive / social update moves particles toward
+    their personal best and the global best. Positions and velocities are
+    clipped to ``[0, 1]`` and ``[-vmax, vmax]`` respectively.
+
+    ``budget`` counts objective evaluations. ``swarm_size`` defaults to
+    ``max(4, min(10 * n_dim, budget))``.
+    """
+    _validate_space(space)
+    if budget < 1:
+        raise ValueError("budget must be >= 1")
+    if not _is_real_number(inertia):
+        raise ValueError("inertia must be a finite number")
+    if not _is_real_number(cognitive) or float(cognitive) < 0.0:
+        raise ValueError("cognitive must be a non-negative finite number")
+    if not _is_real_number(social) or float(social) < 0.0:
+        raise ValueError("social must be a non-negative finite number")
+    if not _is_real_number(vmax) or float(vmax) <= 0.0:
+        raise ValueError("vmax must be a positive finite number")
+    if swarm_size is not None and (
+        not _is_strict_int(swarm_size) or int(swarm_size) < 2
+    ):
+        raise ValueError("swarm_size must be an integer >= 2")
+
+    rng = rng if rng is not None else np.random.default_rng()
+    names = list(space)
+    n_dim = len(names)
+    if swarm_size is None:
+        size = max(4, min(10 * n_dim, int(budget)))
+    else:
+        size = int(swarm_size)
+    size = min(size, int(budget))
+    if size < 2:
+        raise ValueError("budget must be at least 2 for particle swarm")
+
+    w = float(inertia)
+    c1 = float(cognitive)
+    c2 = float(social)
+    v_clip = float(vmax)
+
+    positions = rng.random((size, n_dim))
+    velocities = rng.uniform(-v_clip, v_clip, size=(size, n_dim))
+    personal_best_pos = positions.copy()
+    personal_best_score = np.full(size, np.inf)
+    trials: List[Trial] = []
+    best = float("inf")
+    global_best_pos = positions[0].copy()
+
+    # Evaluate initial swarm.
+    for i in range(size):
+        config = _decode_cmaes_vector(positions[i], names, space)
+        score = float(objective(config))
+        personal_best_score[i] = score
+        personal_best_pos[i] = positions[i].copy()
+        trials.append(Trial(len(trials), config, score))
+        if score < best:
+            best = score
+            global_best_pos = positions[i].copy()
+        if stop_when is not None and stop_when(best, len(trials)):
+            return trials
+
+    while len(trials) < budget:
+        for i in range(size):
+            if len(trials) >= budget:
+                break
+            r1 = rng.random(n_dim)
+            r2 = rng.random(n_dim)
+            velocities[i] = (
+                w * velocities[i]
+                + c1 * r1 * (personal_best_pos[i] - positions[i])
+                + c2 * r2 * (global_best_pos - positions[i])
+            )
+            velocities[i] = np.clip(velocities[i], -v_clip, v_clip)
+            positions[i] = np.clip(positions[i] + velocities[i], 0.0, 1.0)
+            config = _decode_cmaes_vector(positions[i], names, space)
+            score = float(objective(config))
+            trials.append(Trial(len(trials), config, score))
+            if score <= personal_best_score[i]:
+                personal_best_score[i] = score
+                personal_best_pos[i] = positions[i].copy()
+            if score < best:
+                best = score
+                global_best_pos = positions[i].copy()
+            if stop_when is not None and stop_when(best, len(trials)):
+                return trials
+    return trials
+
+
+pso_search = particle_swarm_search
+
+
+
 def _is_strict_int(value: Any) -> bool:
     return isinstance(value, (int, np.integer)) and not isinstance(value, bool)
 

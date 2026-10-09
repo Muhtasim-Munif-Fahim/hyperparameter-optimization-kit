@@ -298,3 +298,22 @@ python -m pytest tests -q -c pyproject.toml
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+
+## Particle Swarm Optimization
+
+`particle_swarm_search` (alias `pso_search`) runs Kennedy & Eberhart PSO on
+the same unit-cube encoding used by CMA-ES and Differential Evolution.
+Particles update velocity with inertia / cognitive / social terms and are
+clipped to `[0, 1]`.
+
+```python
+from hyperopt_kit import particle_swarm_search, parse_space
+import numpy as np
+
+space = parse_space({"x": [0.0, 1.0], "y": [0.0, 1.0]})
+trials = particle_swarm_search(
+    space, lambda p: p["x"] ** 2 + p["y"] ** 2, budget=40, rng=np.random.default_rng(0)
+)
+print(min(t.score for t in trials))
+```
