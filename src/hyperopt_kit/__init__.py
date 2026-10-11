@@ -1,6 +1,14 @@
 """hyperopt-kit: a lightweight hyperparameter optimization toolkit."""
 
 from .evaluate import RunResult, available_strategies, compare_strategies, run_search
+from .quasi_random import (
+    centered_discrepancy,
+    halton_search,
+    halton_sequence,
+    latin_hypercube,
+    lhs_search,
+    quasi_random_search,
+)
 from .report import render_report, write_report
 from .searchers import (
     CMAESParameters,
@@ -62,6 +70,12 @@ __all__ = [
     "bohb_propose",
     "bohb_search",
     "bohb_select_trials",
+    "centered_discrepancy",
+    "halton_search",
+    "halton_sequence",
+    "latin_hypercube",
+    "lhs_search",
+    "quasi_random_search",
     "cmaes_parameters",
     "cmaes_search",
     "cmaes_weights",
