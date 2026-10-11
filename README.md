@@ -35,6 +35,11 @@ fidelity rung.
   adapted from the ranked offspring. Designed for `FloatRange` /
   `IntRange` (including log-scaled ranges); categoricals are encoded as
   ordered coordinates.
+- **Quasi-random search** (`hyperopt_kit.quasi_random`): `quasi_random_search`
+  (strategies `quasi_random`, `halton`, `lhs`) evaluates a scrambled Halton
+  sequence or a (maximin) Latin hypercube instead of i.i.d. uniform draws.
+  It also exposes `halton_sequence`, `latin_hypercube` and Hickernell's
+  `centered_discrepancy` for checking how uniform a design is. NumPy only.
 - **Differential Evolution** (`differential_evolution_search` / `de_search`): classic DE/rand/1/bin (also best/1/bin and rand/2/bin) on the normalized unit cube (Storn & Price, 1997). Mutation and binomial crossover produce trial vectors that greedily replace parents. NumPy only.
 - **Population-based training** (`pbt_search`): a population of
   configurations stepped along fidelity rungs. Every few steps the worst
@@ -158,6 +163,7 @@ many completed PBT steps pass between exploit and explore.
 | --- | --- | --- | --- |
 | `grid` | exhausts a cartesian product, at most `grid_points_per_dim` values per continuous/int parameter | deterministic, no tuning | cost grows with the product of per-dimension resolution |
 | `random` | uniform samples from the spaces | trivial, robust to sharp peaks | wastes evaluations in flat regions |
+| `halton` / `lhs` / `quasi_random` | low-discrepancy design (scrambled Halton or Latin hypercube) mapped through the spaces | same cost as `random`, more even coverage, so fewer wasted near-duplicates at small budgets | no adaptation; the full design is fixed up front |
 | `bayesian` | GP surrogate on normalized inputs + expected improvement | sample-efficient on smooth objectives | fragile with nominal categoricals and non-smooth surfaces |
 | `tpe` | Parzen densities `l(x)` / `g(x)` on good vs bad observations; next point maximizes `l/g` | handles mixed numeric/categorical spaces; numpy-only | factorized per parameter, so it misses interactions |
 | `cmaes` | sample `N(m, σ²C)` in normalized space; adapt mean, step-size and covariance from ranked offspring | models parameter interactions via `C`; strong on smooth continuous / integer ranges | not a natural fit for nominal categoricals; needs a few generations to adapt |
@@ -317,3 +323,36 @@ trials = particle_swarm_search(
 )
 print(min(t.score for t in trials))
 ```
+
+
+## Quasi-random search
+
+`quasi_random_search` is a model-free baseline like `random_search`, but its
+configurations come from a low-discrepancy design (Bergstra & Bengio, 2012).
+
+- `method="halton"` (default): the Halton sequence in the first `d` prime
+  bases. It is scrambled with independent random digit permutations per base
+  and digit position. Unscrambled, it matches
+  `scipy.stats.qmc.Halton(scramble=False)`.
+- `method="lhs"`: a Latin hypercube with one point per stratum in every
+  coordinate. With `n_candidates > 1`, it keeps the maximin design (largest
+  minimum pairwise distance) of that many draws.
+
+Points are mapped with `unit_to_config`. Every integer and categorical value
+gets an equal-width cell of the unit interval, so the design's stratification
+carries over to discrete parameters. `centered_discrepancy` returns
+Hickernell's squared centered L2-discrepancy, which equals
+`scipy.stats.qmc.discrepancy(method="CD")`.
+
+```python
+import numpy as np
+from hyperopt_kit import centered_discrepancy, halton_sequence, parse_space, quasi_random_search
+
+space = parse_space({"lr": [1e-4, 1e-1, "log"], "depth": [2, 10, "int"]})
+objective = lambda p: (np.log10(p["lr"]) + 2.5) ** 2 + 0.1 * (p["depth"] - 6) ** 2
+trials = quasi_random_search(space, objective, budget=32, rng=np.random.default_rng(0))
+print(centered_discrepancy(halton_sequence(128, 4)), "vs", centered_discrepancy(np.random.rand(128, 4)))
+```
+
+From the CLI: `hyperopt-kit search --strategy halton ...` or
+`--strategies random,halton,lhs` in `compare` / `report`.

@@ -22,11 +22,15 @@ from .searchers import (
     successive_halving,
     tpe_search,
 )
+from .quasi_random import halton_search, lhs_search, quasi_random_search
 from .spaces import Space
 
 _STRATEGIES = {
     "grid": grid_search,
     "random": random_search,
+    "quasi_random": quasi_random_search,
+    "halton": halton_search,
+    "lhs": lhs_search,
     "bayesian": bayesian_search,
     "tpe": tpe_search,
     "cmaes": cmaes_search,
@@ -44,6 +48,9 @@ _STRATEGIES = {
 _STRATEGY_KWARGS = {
     "grid": ("grid_points_per_dim",),
     "random": (),
+    "quasi_random": ("method", "scramble", "n_candidates"),
+    "halton": ("scramble",),
+    "lhs": ("n_candidates",),
     "bayesian": ("xi", "n_initial", "n_candidates"),
     "tpe": ("gamma", "n_initial", "n_candidates", "prior_weight", "bandwidth_factor"),
     "cmaes": ("population_size", "sigma0"),
