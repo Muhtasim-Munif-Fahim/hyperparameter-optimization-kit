@@ -41,6 +41,7 @@ fidelity rung.
   It also exposes `halton_sequence`, `latin_hypercube` and Hickernell's
   `centered_discrepancy` for checking how uniform a design is. NumPy only.
 - **Differential Evolution** (`differential_evolution_search` / `de_search`): classic DE/rand/1/bin (also best/1/bin and rand/2/bin) on the normalized unit cube (Storn & Price, 1997). Mutation and binomial crossover produce trial vectors that greedily replace parents. NumPy only.
+- **Simulated annealing** (`simulated_annealing_search` / `sa_search`, strategies `sa`, `simulated_annealing`): one Metropolis chain (Kirkpatrick et al., 1983) with geometric cooling. The start temperature is calibrated so an average uphill neighbour move is accepted with probability 0.8, and Gaussian steps shrink with `sqrt(T/T0)`. Categoricals jump to another choice, and an optional restart returns to the best state. NumPy only.
 - **Population-based training** (`pbt_search`): a population of
   configurations stepped along fidelity rungs. Every few steps the worst
   members copy a better member's weights and hyperparameters, then those
@@ -167,6 +168,7 @@ many completed PBT steps pass between exploit and explore.
 | `bayesian` | GP surrogate on normalized inputs + expected improvement | sample-efficient on smooth objectives | fragile with nominal categoricals and non-smooth surfaces |
 | `tpe` | Parzen densities `l(x)` / `g(x)` on good vs bad observations; next point maximizes `l/g` | handles mixed numeric/categorical spaces; numpy-only | factorized per parameter, so it misses interactions |
 | `cmaes` | sample `N(m, σ²C)` in normalized space; adapt mean, step-size and covariance from ranked offspring | models parameter interactions via `C`; strong on smooth continuous / integer ranges | not a natural fit for nominal categoricals; needs a few generations to adapt |
+| `sa` / `simulated_annealing` | perturb the current config; accept worse moves with probability `exp(-Δ/T)` under geometric cooling `T_k = T0·α^k` | escapes local minima on multimodal surfaces; handles mixed numeric/categorical spaces; trivially cheap per step | single chain, so results vary by seed; the cooling budget matters (`final_temperature_ratio`, `step_size`) |
 | `pbt` | population stepped on fidelity rungs; worst members copy a better member's weights and hyperparameters, then perturb them | online adaptation of a small population; uses partial training instead of restarting | needs a population of at least 2 and a few exploit steps; not in the default comparison set |
 | `hyperband` | several successive-halving brackets with different `(n, r)` allocations | cheap fidelities discard losers early | needs a fidelity-aware objective to save real work; ranking can change across rungs |
 | `bohb` | Hyperband schedule, but new configs maximize `l(x)/g(x)` under a product-kernel density of the best observations at the largest usable fidelity | multi-fidelity sample efficiency; the joint kernel can express interactions that factorized TPE misses | model is idle until both good and bad sets have more points than the dimension; still needs a fidelity-aware objective |
@@ -324,6 +326,31 @@ trials = particle_swarm_search(
 print(min(t.score for t in trials))
 ```
 
+
+## Simulated annealing
+
+`simulated_annealing_search` (alias `sa_search`) works in four steps:
+
+1. Evaluate a few random configurations and start from the best.
+2. Make a short greedy warm-up of neighbour moves. This calibrates `T0 = -mean(uphill Δ) / ln(0.8)` (Kirkpatrick's rule).
+3. Anneal with `T_k = T0 · α^k`. By default `α` reaches `final_temperature_ratio · T0` on the last evaluation.
+4. At each step a neighbour perturbs each parameter with probability `1/n_params`, and always at least one. Numeric parameters move by `N(0, σ)` in normalized space with `σ = max(min_step, step_size · sqrt(T/T0))`; categoricals jump to a different choice. Worse moves are accepted with the Metropolis probability `exp(-Δ/T)` (`metropolis_acceptance`).
+
+`restart_after=k` jumps back to the best state after `k` steps without improvement. `geometric_cooling_schedule` returns the temperature path.
+
+```python
+import numpy as np
+from hyperopt_kit import parse_space, simulated_annealing_search
+
+space = parse_space({"x": [-5.12, 5.12], "y": [-5.12, 5.12]})
+rastrigin = lambda p: 20 + sum(p[k] ** 2 - 10 * np.cos(2 * np.pi * p[k]) for k in "xy")
+trials = simulated_annealing_search(space, rastrigin, budget=200, rng=np.random.default_rng(0))
+print(min(t.score for t in trials))
+```
+
+```bash
+hyperopt-kit search --space '{"a": [0.1, 5.0], "b": [0.1, 5.0]}' --objective demo --budget 40 --strategy sa
+```
 
 ## Quasi-random search
 

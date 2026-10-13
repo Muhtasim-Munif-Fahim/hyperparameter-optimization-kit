@@ -19,6 +19,7 @@ from .searchers import (
     pbt_search,
     random_search,
     random_successive_halving,
+    simulated_annealing_search,
     successive_halving,
     tpe_search,
 )
@@ -38,6 +39,8 @@ _STRATEGIES = {
     "differential_evolution": differential_evolution_search,
     "pso": particle_swarm_search,
     "particle_swarm": particle_swarm_search,
+    "sa": simulated_annealing_search,
+    "simulated_annealing": simulated_annealing_search,
     "pbt": pbt_search,
     "hyperband": hyperband_search,
     "bohb": bohb_search,
@@ -58,6 +61,8 @@ _STRATEGY_KWARGS = {
     "differential_evolution": ("population_size", "mutation", "crossover", "strategy"),
     "pso": ("swarm_size", "inertia", "cognitive", "social", "vmax"),
     "particle_swarm": ("swarm_size", "inertia", "cognitive", "social", "vmax"),
+    "sa": ("initial_temperature", "cooling", "final_temperature_ratio", "initial_acceptance", "n_initial", "step_size", "min_step", "perturb_prob", "restart_after"),
+    "simulated_annealing": ("initial_temperature", "cooling", "final_temperature_ratio", "initial_acceptance", "n_initial", "step_size", "min_step", "perturb_prob", "restart_after"),
     "pbt": (
         "population_size",
         "exploit_interval",

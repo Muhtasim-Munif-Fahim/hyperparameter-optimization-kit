@@ -23,6 +23,8 @@ from a multivariate product-kernel density of the best observations
 rungs, copies weights and hyperparameters from better members into worse
 ones, then perturbs those hyperparameters (Jaderberg et al., 2017).
 ``differential_evolution_search`` runs classic DE/rand/1/bin (and related strategies) on the normalized unit cube (Storn & Price, 1997).
+``simulated_annealing_search`` walks a single Metropolis chain with geometric
+cooling, a Kirkpatrick-calibrated start temperature and shrinking steps.
 """
 
 from __future__ import annotations
@@ -2602,3 +2604,235 @@ def pbt_search(
 
 
 population_based_training = pbt_search
+
+
+# ---------------------------------------------------------------------------
+# Simulated annealing
+# ---------------------------------------------------------------------------
+
+
+def metropolis_acceptance(delta: float, temperature: float) -> float:
+    """Probability of accepting a move that changes the score by ``delta``.
+
+    Improvements (``delta <= 0``) are always accepted; worse moves with
+    probability ``exp(-delta / T)``. ``T = 0`` means greedy descent.
+    """
+    if not _is_real_number(delta):
+        raise ValueError("delta must be a finite number")
+    if not _is_real_number(temperature) or float(temperature) < 0.0:
+        raise ValueError("temperature must be a non-negative finite number")
+    if delta <= 0.0:
+        return 1.0
+    if temperature == 0.0:
+        return 0.0
+    return float(math.exp(-float(delta) / float(temperature)))
+
+
+def geometric_cooling_schedule(
+    initial_temperature: float, n_steps: int, *, cooling: Optional[float] = None,
+    final_temperature_ratio: float = 1e-3,
+) -> np.ndarray:
+    """Temperatures ``T_k = T0 * alpha^k`` for ``k = 0 .. n_steps - 1``.
+
+    ``cooling`` (``alpha`` in ``(0, 1)``) defaults to the rate that reaches
+    ``final_temperature_ratio * T0`` at the last step.
+    """
+    if not _is_real_number(initial_temperature) or float(initial_temperature) <= 0.0:
+        raise ValueError("initial_temperature must be a positive finite number")
+    if not _is_strict_int(n_steps) or int(n_steps) < 1:
+        raise ValueError("n_steps must be a positive integer")
+    alpha = _resolve_cooling(cooling, final_temperature_ratio, int(n_steps))
+    return float(initial_temperature) * alpha ** np.arange(int(n_steps), dtype=float)
+
+
+def _resolve_cooling(cooling: Optional[float], final_ratio: float, n_steps: int) -> float:
+    if cooling is not None:
+        if not _is_real_number(cooling) or not 0.0 < float(cooling) < 1.0:
+            raise ValueError("cooling must be in (0, 1)")
+        return float(cooling)
+    if not _is_real_number(final_ratio) or not 0.0 < float(final_ratio) < 1.0:
+        raise ValueError("final_temperature_ratio must be in (0, 1)")
+    return float(final_ratio) ** (1.0 / max(1, n_steps - 1))
+
+
+def _anneal_neighbour(
+    current: Dict[str, Any],
+    space: Dict[str, Space],
+    names: List[str],
+    sigma: float,
+    perturb_prob: float,
+    rng: np.random.Generator,
+) -> Dict[str, Any]:
+    """Perturb a non-empty random subset of parameters.
+
+    Numeric parameters take a Gaussian step of scale ``sigma`` in the
+    normalized unit interval (reflected at the bounds); categoricals jump
+    to a different choice uniformly at random.
+    """
+    chosen = [name for name in names if rng.random() < perturb_prob]
+    if not chosen:
+        chosen = [names[int(rng.integers(len(names)))]]
+    out = dict(current)
+    for name in chosen:
+        sp = space[name]
+        if isinstance(sp, Categorical):
+            if len(sp.choices) > 1:
+                others = [c for c in sp.choices if c != current[name]]
+                out[name] = others[int(rng.integers(len(others)))]
+            continue
+        x = sp.normalize(current[name]) + float(rng.normal(0.0, sigma))
+        # reflect into [0, 1]
+        x = abs(x) % 2.0
+        if x > 1.0:
+            x = 2.0 - x
+        out[name] = sp.denormalize(x)
+    return out
+
+
+def simulated_annealing_search(
+    space: Dict[str, Space],
+    objective: ScoreFn,
+    budget: int,
+    rng: Optional[np.random.Generator] = None,
+    stop_when: Stopper = None,
+    *,
+    initial_temperature: Optional[float] = None,
+    cooling: Optional[float] = None,
+    final_temperature_ratio: float = 1e-3,
+    initial_acceptance: float = 0.8,
+    n_initial: Optional[int] = None,
+    step_size: float = 0.15,
+    min_step: float = 0.01,
+    perturb_prob: Optional[float] = None,
+    restart_after: Optional[int] = None,
+) -> List[Trial]:
+    """Simulated annealing (Kirkpatrick, Gelatt & Vecchi, 1983) with geometric cooling.
+
+    1. ``n_initial`` uniform random configurations (default
+       ``max(2, min(10, budget // 10))``) are evaluated. The best one is
+       the starting state. When ``initial_temperature`` is ``None``, another
+       ``n_initial`` greedy neighbour moves from that state record the uphill
+       score changes, and ``T0`` is set so an average uphill move is
+       accepted with probability ``initial_acceptance``:
+       ``T0 = -mean(uphill) / ln(initial_acceptance)`` (Kirkpatrick's rule).
+    2. Each later step proposes a neighbour (see below) and accepts it with
+       the Metropolis rule :func:`metropolis_acceptance` at temperature
+       ``T_k = T0 * alpha^k``. ``alpha`` = ``cooling``, or by default the
+       rate that reaches ``final_temperature_ratio * T0`` on the last
+       evaluation.
+    3. The neighbour perturbs each parameter with probability
+       ``perturb_prob`` (default ``1 / n_params``), and always at least one.
+       Numeric parameters take a Gaussian step in normalized space with
+       ``sigma = max(min_step, step_size * sqrt(T_k / T0))``, so steps
+       shrink as the system cools. Categoricals jump to another choice.
+    4. ``restart_after`` (optional): after that many steps without a new
+       best score, the chain jumps back to the best state found so far.
+
+    Scores are minimized. ``budget`` counts every objective evaluation.
+    """
+    _validate_space(space)
+    if not _is_strict_int(budget) or int(budget) < 1:
+        raise ValueError("budget must be >= 1")
+    budget = int(budget)
+    if initial_temperature is not None and (
+        not _is_real_number(initial_temperature) or float(initial_temperature) <= 0.0
+    ):
+        raise ValueError("initial_temperature must be a positive finite number")
+    if not _is_real_number(initial_acceptance) or not 0.0 < float(initial_acceptance) < 1.0:
+        raise ValueError("initial_acceptance must be in (0, 1)")
+    if not _is_real_number(step_size) or float(step_size) <= 0.0:
+        raise ValueError("step_size must be a positive finite number")
+    if not _is_real_number(min_step) or float(min_step) < 0.0:
+        raise ValueError("min_step must be a non-negative finite number")
+    if perturb_prob is not None and (
+        not _is_real_number(perturb_prob) or not 0.0 < float(perturb_prob) <= 1.0
+    ):
+        raise ValueError("perturb_prob must be in (0, 1]")
+    if restart_after is not None and (not _is_strict_int(restart_after) or int(restart_after) < 1):
+        raise ValueError("restart_after must be a positive integer")
+    if n_initial is not None and (not _is_strict_int(n_initial) or int(n_initial) < 1):
+        raise ValueError("n_initial must be a positive integer")
+    # validate cooling arguments eagerly
+    _resolve_cooling(cooling, final_temperature_ratio, 2)
+
+    rng = rng if rng is not None else np.random.default_rng()
+    names = list(space)
+    p_move = float(perturb_prob) if perturb_prob is not None else 1.0 / len(names)
+    n0 = int(n_initial) if n_initial is not None else max(2, min(10, budget // 10))
+    n0 = min(n0, budget)
+
+    trials: List[Trial] = []
+    best = float("inf")
+    best_params: Dict[str, Any] = {}
+    for _ in range(n0):
+        params = _sample_config(space, rng)
+        score = float(objective(params))
+        trials.append(Trial(len(trials), params, score))
+        if score < best:
+            best, best_params = score, params
+        if stop_when is not None and stop_when(best, len(trials)):
+            return trials
+    if len(trials) >= budget:
+        return trials
+
+    current, current_score = dict(best_params), best
+    since_best = 0
+
+    def _step(cand: Dict[str, Any], score: float, temp: float) -> None:
+        nonlocal current, current_score, best, best_params, since_best
+        delta = score - current_score
+        if not math.isfinite(score):
+            accept = False
+        elif not math.isfinite(current_score) or delta <= 0.0:
+            accept = True
+        else:
+            accept = rng.random() < metropolis_acceptance(delta, temp)
+        if accept:
+            current, current_score = cand, score
+        if score < best:
+            best, best_params = score, cand
+            since_best = 0
+        else:
+            since_best += 1
+        if restart_after is not None and since_best >= int(restart_after):
+            current, current_score = dict(best_params), best
+            since_best = 0
+
+    if initial_temperature is not None:
+        t0 = float(initial_temperature)
+    else:
+        # Kirkpatrick calibration on real neighbour moves: a short greedy
+        # warm-up (T = 0) records the uphill deltas, then
+        # T0 = -mean(uphill) / ln(initial_acceptance).
+        uphill: List[float] = []
+        n_warm = min(n0, budget - len(trials))
+        warm_sigma = max(float(min_step), float(step_size))
+        for _ in range(n_warm):
+            cand = _anneal_neighbour(current, space, names, warm_sigma, p_move, rng)
+            score = float(objective(cand))
+            trials.append(Trial(len(trials), cand, score))
+            if math.isfinite(score) and math.isfinite(current_score) and score > current_score:
+                uphill.append(score - current_score)
+            _step(cand, score, 0.0)
+            if stop_when is not None and stop_when(best, len(trials)):
+                return trials
+        mean_up = float(np.mean(uphill)) if uphill else 0.0
+        t0 = -mean_up / math.log(float(initial_acceptance)) if mean_up > 0 else 1e-12
+        if len(trials) >= budget:
+            return trials
+
+    n_steps = budget - len(trials)
+    alpha = _resolve_cooling(cooling, final_temperature_ratio, n_steps)
+    for k in range(n_steps):
+        temp = t0 * alpha**k
+        sigma = max(float(min_step), float(step_size) * math.sqrt(temp / t0))
+        cand = _anneal_neighbour(current, space, names, sigma, p_move, rng)
+        score = float(objective(cand))
+        trials.append(Trial(len(trials), cand, score))
+        _step(cand, score, temp)
+        if stop_when is not None and stop_when(best, len(trials)):
+            break
+    return trials
+
+
+sa_search = simulated_annealing_search
