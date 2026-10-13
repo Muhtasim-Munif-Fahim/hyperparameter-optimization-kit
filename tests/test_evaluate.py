@@ -81,6 +81,8 @@ def test_available_strategies_lists_tpe_cmaes_hyperband_and_bohb():
         "differential_evolution",
         "pso",
         "particle_swarm",
+        "sa",
+        "simulated_annealing",
         "pbt",
         "hyperband",
         "bohb",
