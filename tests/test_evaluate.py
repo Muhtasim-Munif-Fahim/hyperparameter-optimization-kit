@@ -83,6 +83,8 @@ def test_available_strategies_lists_tpe_cmaes_hyperband_and_bohb():
         "particle_swarm",
         "sa",
         "simulated_annealing",
+        "nm",
+        "nelder_mead",
         "pbt",
         "hyperband",
         "bohb",
