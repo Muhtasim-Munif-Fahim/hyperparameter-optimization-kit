@@ -25,6 +25,9 @@ ones, then perturbs those hyperparameters (Jaderberg et al., 2017).
 ``differential_evolution_search`` runs classic DE/rand/1/bin (and related strategies) on the normalized unit cube (Storn & Price, 1997).
 ``simulated_annealing_search`` walks a single Metropolis chain with geometric
 cooling, a Kirkpatrick-calibrated start temperature and shrinking steps.
+``nelder_mead_search`` runs the derivative-free downhill simplex (Nelder &
+Mead, 1965) on the normalized numeric parameters with box projection,
+optional dimension-adaptive coefficients (Gao & Han, 2012) and restarts.
 """
 
 from __future__ import annotations
@@ -2836,3 +2839,170 @@ def simulated_annealing_search(
 
 
 sa_search = simulated_annealing_search
+
+
+class _BudgetExhausted(Exception):
+    """Internal signal: the evaluation budget (or ``stop_when``) is spent."""
+
+
+def nelder_mead_coefficients(n_dims: int, adaptive: bool = False) -> Tuple[float, float, float, float]:
+    """Reflection, expansion, contraction and shrink coefficients.
+
+    Standard values are ``(1, 2, 0.5, 0.5)``. With ``adaptive=True`` they
+    follow Gao & Han (2012): ``(1, 1 + 2/n, 0.75 - 1/(2n), 1 - 1/n)``, which
+    keeps the simplex from degenerating in higher dimensions.
+    """
+    if not _is_strict_int(n_dims) or int(n_dims) < 1:
+        raise ValueError("n_dims must be a positive integer")
+    n = int(n_dims)
+    if not adaptive:
+        return 1.0, 2.0, 0.5, 0.5
+    return 1.0, 1.0 + 2.0 / n, 0.75 - 1.0 / (2.0 * n), 1.0 - 1.0 / n
+
+
+def nelder_mead_search(
+    space: Dict[str, Space],
+    objective: ScoreFn,
+    budget: int,
+    rng: Optional[np.random.Generator] = None,
+    stop_when: Stopper = None,
+    *,
+    n_initial: Optional[int] = None,
+    initial_step: float = 0.2,
+    adaptive: bool = True,
+    xtol: float = 1e-3,
+    ftol: float = 1e-8,
+) -> List[Trial]:
+    """Nelder-Mead downhill simplex (Nelder & Mead, 1965) in normalized space.
+
+    1. ``n_initial`` uniform random configurations (default
+       ``max(1, min(10, budget // 10))``) are evaluated; the best one seeds
+       the search and fixes the categorical parameters.
+    2. FloatRange / IntRange parameters are optimized in the normalized unit
+       cube. The initial simplex is the seed plus ``initial_step`` along each
+       axis (stepping inward when that would leave the cube).
+    3. Each iteration reflects the worst vertex through the centroid of the
+       others, then expands, contracts (outside or inside) or shrinks the
+       simplex toward the best vertex. Proposed points are projected onto
+       ``[0, 1]^n``, so every evaluated configuration is feasible.
+       ``adaptive=True`` (default) uses the dimension-dependent coefficients
+       of Gao & Han (2012); see :func:`nelder_mead_coefficients`.
+    4. When the simplex collapses (max vertex distance from the best below
+       ``xtol``, or score spread below ``ftol``) the search restarts with a
+       fresh simplex of ``initial_step`` around the best point found so far.
+       Restarts after the first draw new categorical values uniformly, so
+       mixed spaces still explore their categorical choices.
+
+    With no numeric parameters the method falls back to uniform random
+    sampling. Scores are minimized; non-finite scores count as ``+inf``.
+    ``budget`` counts every objective evaluation.
+    """
+    _validate_space(space)
+    if not _is_strict_int(budget) or int(budget) < 1:
+        raise ValueError("budget must be >= 1")
+    budget = int(budget)
+    if n_initial is not None and (not _is_strict_int(n_initial) or int(n_initial) < 1):
+        raise ValueError("n_initial must be a positive integer")
+    if not _is_real_number(initial_step) or not 0.0 < float(initial_step) <= 1.0:
+        raise ValueError("initial_step must be in (0, 1]")
+    if not _is_real_number(xtol) or float(xtol) < 0.0:
+        raise ValueError("xtol must be a non-negative finite number")
+    if not _is_real_number(ftol) or float(ftol) < 0.0:
+        raise ValueError("ftol must be a non-negative finite number")
+
+    rng = rng if rng is not None else np.random.default_rng()
+    numeric = [n for n, sp in space.items() if not isinstance(sp, Categorical)]
+    categorical = [n for n, sp in space.items() if isinstance(sp, Categorical)]
+    if not numeric:
+        return random_search(space, objective, budget, rng=rng, stop_when=stop_when)
+
+    dim = len(numeric)
+    alpha, gamma, rho, sigma = nelder_mead_coefficients(dim, adaptive=bool(adaptive))
+    step = float(initial_step)
+    trials: List[Trial] = []
+    best_score = float("inf")
+    best_params: Dict[str, Any] = {}
+
+    def record(params: Dict[str, Any]) -> float:
+        nonlocal best_score, best_params
+        if len(trials) >= budget:
+            raise _BudgetExhausted
+        raw = float(objective(params))
+        trials.append(Trial(len(trials), params, raw))
+        score = raw if math.isfinite(raw) else float("inf")
+        if score < best_score:
+            best_score, best_params = score, dict(params)
+        if stop_when is not None and stop_when(best_score, len(trials)):
+            raise _BudgetExhausted
+        return score
+
+    def to_params(x: np.ndarray, cats: Dict[str, Any]) -> Dict[str, Any]:
+        out = {name: space[name].denormalize(float(v)) for name, v in zip(numeric, x)}
+        out.update(cats)
+        return {name: out[name] for name in space}
+
+    def initial_simplex(x0: np.ndarray) -> List[np.ndarray]:
+        vertices = [x0.copy()]
+        for j in range(dim):
+            v = x0.copy()
+            v[j] = v[j] + step if v[j] + step <= 1.0 else v[j] - step
+            vertices.append(np.clip(v, 0.0, 1.0))
+        return vertices
+
+    n0 = int(n_initial) if n_initial is not None else max(1, min(10, budget // 10))
+    try:
+        for _ in range(min(n0, budget)):
+            record(_sample_config(space, rng))
+        restarts = 0
+        while True:
+            seed = best_params
+            cats = {name: seed[name] for name in categorical}
+            if restarts > 0 and categorical:
+                cats = {name: space[name].sample(rng) for name in categorical}
+            x0 = np.array([space[name].normalize(seed[name]) for name in numeric], dtype=float)
+            simplex = initial_simplex(x0)
+            scores = [record(to_params(v, cats)) for v in simplex]
+            while True:
+                order = np.argsort(scores, kind="stable")
+                simplex = [simplex[i] for i in order]
+                scores = [scores[i] for i in order]
+                spread = max(float(np.max(np.abs(v - simplex[0]))) for v in simplex[1:])
+                finite = [f for f in scores if math.isfinite(f)]
+                f_spread = (max(finite) - min(finite)) if len(finite) == len(scores) else float("inf")
+                if spread < float(xtol) or f_spread < float(ftol):
+                    break
+                centroid = np.mean(simplex[:-1], axis=0)
+                worst, f_worst = simplex[-1], scores[-1]
+                xr = np.clip(centroid + alpha * (centroid - worst), 0.0, 1.0)
+                fr = record(to_params(xr, cats))
+                if fr < scores[0]:
+                    xe = np.clip(centroid + gamma * (xr - centroid), 0.0, 1.0)
+                    fe = record(to_params(xe, cats))
+                    simplex[-1], scores[-1] = (xe, fe) if fe < fr else (xr, fr)
+                    continue
+                if fr < scores[-2]:
+                    simplex[-1], scores[-1] = xr, fr
+                    continue
+                if fr < f_worst:
+                    xc = np.clip(centroid + rho * (xr - centroid), 0.0, 1.0)
+                    fc = record(to_params(xc, cats))
+                    if fc <= fr:
+                        simplex[-1], scores[-1] = xc, fc
+                        continue
+                else:
+                    xc = np.clip(centroid + rho * (worst - centroid), 0.0, 1.0)
+                    fc = record(to_params(xc, cats))
+                    if fc < f_worst:
+                        simplex[-1], scores[-1] = xc, fc
+                        continue
+                # shrink toward the best vertex
+                for i in range(1, len(simplex)):
+                    simplex[i] = simplex[0] + sigma * (simplex[i] - simplex[0])
+                    scores[i] = record(to_params(simplex[i], cats))
+            restarts += 1
+    except _BudgetExhausted:
+        pass
+    return trials
+
+
+nm_search = nelder_mead_search
