@@ -28,6 +28,9 @@ cooling, a Kirkpatrick-calibrated start temperature and shrinking steps.
 ``nelder_mead_search`` runs the derivative-free downhill simplex (Nelder &
 Mead, 1965) on the normalized numeric parameters with box projection,
 optional dimension-adaptive coefficients (Gao & Han, 2012) and restarts.
+``cross_entropy_search`` runs the cross-entropy method (Rubinstein, 1999):
+sample a population from a diagonal Gaussian (numeric) / categorical
+distribution, refit it to the elite fraction with smoothing, repeat.
 """
 
 from __future__ import annotations
@@ -3006,3 +3009,146 @@ def nelder_mead_search(
 
 
 nm_search = nelder_mead_search
+
+
+def cross_entropy_update(
+    mean: np.ndarray,
+    std: np.ndarray,
+    elites: np.ndarray,
+    smoothing: float = 0.7,
+    min_std: float = 0.02,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """One smoothed cross-entropy update of a diagonal Gaussian.
+
+    ``elites`` has shape ``(n_elite, dim)``. The new parameters are
+    ``smoothing * elite_stat + (1 - smoothing) * old`` for both the mean and
+    the standard deviation (de Boer et al., 2005), and the standard
+    deviation is floored at ``min_std`` so the search never collapses to a
+    point.
+    """
+    mean = np.asarray(mean, dtype=float)
+    std = np.asarray(std, dtype=float)
+    elites = np.atleast_2d(np.asarray(elites, dtype=float))
+    if elites.shape[0] < 1 or elites.shape[1] != mean.shape[0]:
+        raise ValueError("elites must have shape (n_elite, dim) with n_elite >= 1")
+    if not _is_real_number(smoothing) or not 0.0 < float(smoothing) <= 1.0:
+        raise ValueError("smoothing must be in (0, 1]")
+    if not _is_real_number(min_std) or float(min_std) < 0.0:
+        raise ValueError("min_std must be a non-negative finite number")
+    a = float(smoothing)
+    new_mean = a * elites.mean(axis=0) + (1.0 - a) * mean
+    new_std = a * elites.std(axis=0) + (1.0 - a) * std
+    return new_mean, np.maximum(new_std, float(min_std))
+
+
+def cross_entropy_search(
+    space: Dict[str, Space],
+    objective: ScoreFn,
+    budget: int,
+    rng: Optional[np.random.Generator] = None,
+    stop_when: Stopper = None,
+    *,
+    population_size: Optional[int] = None,
+    elite_fraction: float = 0.2,
+    smoothing: float = 0.7,
+    initial_std: float = 0.3,
+    min_std: float = 0.02,
+    min_probability: float = 0.02,
+) -> List[Trial]:
+    """Cross-entropy method (Rubinstein, 1999; de Boer et al., 2005).
+
+    The search keeps a sampling distribution over configurations and, each
+    generation, refits it to the best ("elite") samples:
+
+    * FloatRange / IntRange parameters use an independent Gaussian in the
+      normalized unit cube, starting at mean ``0.5`` and standard deviation
+      ``initial_std``; samples are clipped to ``[0, 1]`` before being mapped
+      back through the space (log scales and integer rounding included).
+    * Categorical parameters use a probability vector, starting uniform.
+
+    A generation draws ``population_size`` configurations (default
+    ``max(10, 4 * n_params)``), evaluates them, keeps the best
+    ``ceil(elite_fraction * population_size)`` (at least two), and moves the
+    distribution toward their statistics with step ``smoothing``: Gaussian
+    means and standard deviations via :func:`cross_entropy_update` (floored
+    at ``min_std``), categorical probabilities toward the elite frequencies,
+    mixed with ``min_probability`` of the uniform distribution so no choice
+    is ever ruled out. Smoothing and the floors are what keep plain CEM from
+    converging prematurely.
+
+    Unlike CMA-ES the Gaussian is diagonal (no parameter interactions), but
+    categoricals are modeled natively. Scores are minimized; non-finite
+    scores rank last. ``budget`` counts every evaluation; the final
+    generation is truncated to fit.
+    """
+    _validate_space(space)
+    if not _is_strict_int(budget) or int(budget) < 1:
+        raise ValueError("budget must be >= 1")
+    budget = int(budget)
+    if population_size is not None and (not _is_strict_int(population_size) or int(population_size) < 2):
+        raise ValueError("population_size must be an integer >= 2")
+    if not _is_real_number(elite_fraction) or not 0.0 < float(elite_fraction) <= 1.0:
+        raise ValueError("elite_fraction must be in (0, 1]")
+    if not _is_real_number(smoothing) or not 0.0 < float(smoothing) <= 1.0:
+        raise ValueError("smoothing must be in (0, 1]")
+    if not _is_real_number(initial_std) or float(initial_std) <= 0.0:
+        raise ValueError("initial_std must be a positive finite number")
+    if not _is_real_number(min_std) or float(min_std) < 0.0:
+        raise ValueError("min_std must be a non-negative finite number")
+    if not _is_real_number(min_probability) or not 0.0 <= float(min_probability) < 1.0:
+        raise ValueError("min_probability must be in [0, 1)")
+
+    rng = rng if rng is not None else np.random.default_rng()
+    names = list(space)
+    numeric = [n for n in names if not isinstance(space[n], Categorical)]
+    categorical = [n for n in names if isinstance(space[n], Categorical)]
+    pop = int(population_size) if population_size is not None else max(10, 4 * len(names))
+    n_elite = min(pop, max(2, int(math.ceil(float(elite_fraction) * pop))))
+    a = float(smoothing)
+    eps = float(min_probability)
+
+    mean = np.full(len(numeric), 0.5)
+    std = np.full(len(numeric), float(initial_std))
+    probs = {n: np.full(len(space[n].choices), 1.0 / len(space[n].choices)) for n in categorical}
+
+    trials: List[Trial] = []
+    best = float("inf")
+    while len(trials) < budget:
+        size = min(pop, budget - len(trials))
+        X = np.clip(mean + std * rng.normal(size=(size, len(numeric))), 0.0, 1.0)
+        cat_idx = {n: rng.choice(len(p), size=size, p=p) for n, p in probs.items()}
+        scores = np.empty(size)
+        stopped = False
+        for i in range(size):
+            params: Dict[str, Any] = {n: space[n].denormalize(float(X[i, j])) for j, n in enumerate(numeric)}
+            for n in categorical:
+                params[n] = space[n].choices[int(cat_idx[n][i])]
+            params = {n: params[n] for n in names}
+            raw = float(objective(params))
+            trials.append(Trial(len(trials), params, raw))
+            scores[i] = raw if math.isfinite(raw) else float("inf")
+            best = min(best, scores[i])
+            if stop_when is not None and stop_when(best, len(trials)):
+                stopped = True
+                break
+        if stopped or size < pop:
+            break
+        elite = np.argsort(scores, kind="stable")[:n_elite]
+        if numeric:
+            # refit on the re-normalized evaluated values so integer rounding
+            # and clipping are reflected in the distribution
+            Z = np.array(
+                [[space[n].normalize(trials[-size + i].params[n]) for n in numeric] for i in elite],
+                dtype=float,
+            )
+            mean, std = cross_entropy_update(mean, std, Z, smoothing=a, min_std=float(min_std))
+        for n in categorical:
+            k = len(probs[n])
+            freq = np.bincount(cat_idx[n][elite], minlength=k) / float(n_elite)
+            p = a * freq + (1.0 - a) * probs[n]
+            p = (1.0 - eps) * p + eps / k
+            probs[n] = p / p.sum()
+    return trials
+
+
+cem_search = cross_entropy_search
