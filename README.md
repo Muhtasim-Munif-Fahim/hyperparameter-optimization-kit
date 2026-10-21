@@ -387,3 +387,42 @@ print(centered_discrepancy(halton_sequence(128, 4)), "vs", centered_discrepancy(
 
 From the CLI: `hyperopt-kit search --strategy halton ...` or
 `--strategies random,halton,lhs` in `compare` / `report`.
+
+## Multi-objective search (NSGA-II, Pareto front, hypervolume)
+
+When tuning trades off competing goals (validation loss against latency,
+model size or cost), `hyperopt_kit.multi_objective` searches for the whole
+Pareto front instead of a single optimum. Every objective is minimised.
+
+- `nsga2_search(space, objective, budget, rng, population_size=None)` runs
+  NSGA-II (Deb et al., 2002) on the normalised unit cube of any space (float,
+  int, log, categorical). It uses binary tournament on (rank, crowding),
+  bounded SBX crossover, polynomial mutation and elitist (mu + lambda) survival.
+  `objective(params)` returns a sequence of floats.
+- `pareto_trials(trials)` returns the non-dominated, de-duplicated trials.
+- `non_dominated_sort`, `pareto_front_mask`, `dominates` and `crowding_distance`
+  are the building blocks.
+- `hypervolume(F, ref)` gives the exact dominated hypervolume: a 2-D sweep, or
+  recursive slicing for 3 or more objectives.
+- `igd` and `generational_distance` measure distance to a known reference front.
+- `zdt1` and `demo_multi_objective` are built-in benchmarks.
+
+```python
+import numpy as np
+from hyperopt_kit import FloatRange, nsga2_search, pareto_trials, hypervolume, zdt1
+
+space = {f"x{i}": FloatRange(0.0, 1.0) for i in range(5)}
+trials = nsga2_search(space, zdt1, budget=2000, rng=np.random.default_rng(0), population_size=40)
+front = pareto_trials(trials)
+print(len(front), hypervolume([t.objectives for t in front], ref=[1.1, 1.1]))  # ~0.873 (true front 0.874)
+```
+
+```bash
+python -m hyperopt_kit.cli pareto --space '{"a": [0.1, 5.0], "b": [0.1, 5.0]}' --budget 120 --seed 7
+python -m hyperopt_kit.cli pareto --space '{"x0": [0, 1], "x1": [0, 1]}' --objective zdt1 --budget 400 --json
+```
+
+Checked against reference libraries: on random fronts with 2–4 objectives,
+the hypervolume matches `moocore`, and non-dominated sorting, crowding
+distance (up to pymoo's 1/n_obj averaging), IGD and GD match `pymoo`, all to
+floating-point precision.
