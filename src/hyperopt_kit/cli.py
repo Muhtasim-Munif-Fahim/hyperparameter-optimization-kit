@@ -1,4 +1,4 @@
-"""Command-line interface: ``search``, ``compare`` and ``report`` subcommands."""
+"""Command-line interface: ``search``, ``compare``, ``report`` and ``pareto`` subcommands."""
 
 from __future__ import annotations
 
@@ -9,7 +9,8 @@ import sys
 from typing import List, Optional
 
 from .evaluate import available_strategies, compare_strategies, run_search
-from .objectives import demo_objective
+from .multi_objective import hypervolume, nsga2_search, pareto_trials
+from .objectives import demo_multi_objective, demo_objective, zdt1
 from .report import render_report, write_report
 from .spaces import parse_space
 
@@ -192,12 +193,79 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(p_report)
     p_report.add_argument("--out", default="hyperopt_report.md", help="output markdown path")
     p_report.add_argument("--title", default="Hyperparameter search comparison")
+
+    p_pareto = sub.add_parser(
+        "pareto", help="multi-objective NSGA-II search; prints the Pareto front and hypervolume"
+    )
+    p_pareto.add_argument("--space", required=True, help="JSON space spec, or @path/to/space.json")
+    p_pareto.add_argument(
+        "--objective", default="demo",
+        help="'demo' (loss vs. a+b cost), 'zdt1', or a 'module:function' returning a sequence",
+    )
+    p_pareto.add_argument("--budget", type=_positive_int, required=True, help="number of evaluations")
+    p_pareto.add_argument("--population-size", type=_population_size, default=None)
+    p_pareto.add_argument("--seed", type=int, default=None)
+    p_pareto.add_argument(
+        "--ref", default=None,
+        help="comma-separated hypervolume reference point (default: per-objective max of all trials + 10%% of range)",
+    )
+    p_pareto.add_argument("--json", action="store_true", help="print the front as JSON")
     return parser
+
+
+def _run_pareto(args, parser) -> int:
+    import numpy as np
+
+    try:
+        space = _load_space(args.space)
+        if args.objective == "demo":
+            objective = demo_multi_objective
+        elif args.objective == "zdt1":
+            objective = zdt1
+        else:
+            objective = _load_objective(args.objective)
+    except Exception as exc:
+        parser.error(str(exc))
+    rng = np.random.default_rng(args.seed)
+    try:
+        trials = nsga2_search(space, objective, args.budget, rng, population_size=args.population_size)
+    except ValueError as exc:
+        parser.error(str(exc))
+    front = pareto_trials(trials)
+    F = np.array([t.objectives for t in trials])
+    if args.ref:
+        ref = [float(v) for v in args.ref.split(",")]
+        if len(ref) != F.shape[1]:
+            parser.error(f"--ref needs {F.shape[1]} comma-separated values")
+    else:
+        span = F.max(axis=0) - F.min(axis=0)
+        ref = (F.max(axis=0) + 0.1 * np.where(span > 0, span, 1.0)).tolist()
+    hv = hypervolume([t.objectives for t in front], ref)
+    if args.json:
+        print(json.dumps({
+            "trials": len(trials),
+            "hypervolume": hv,
+            "ref": ref,
+            "front": [{"iteration": t.iteration, "params": t.params, "objectives": list(t.objectives)} for t in front],
+        }, default=str))
+        return 0
+    print(f"trials: {len(trials)}")
+    print(f"pareto front: {len(front)} configurations")
+    print(f"hypervolume: {hv:.6g} (ref {', '.join(f'{r:.4g}' for r in ref)})")
+    m = F.shape[1]
+    print("| iter | " + " | ".join(f"f{j + 1}" for j in range(m)) + " | params |")
+    print("| ---: | " + " | ".join("---:" for _ in range(m)) + " | --- |")
+    for t in front:
+        vals = " | ".join(f"{v:.5g}" for v in t.objectives)
+        print(f"| {t.iteration} | {vals} | {json.dumps(t.params, default=str, sort_keys=True)} |")
+    return 0
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "pareto":
+        return _run_pareto(args, parser)
     try:
         space = _load_space(args.space)
         objective = _load_objective(args.objective)

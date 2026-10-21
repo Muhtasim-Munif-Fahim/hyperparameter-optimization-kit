@@ -47,3 +47,32 @@ def demo_objective(params: Dict, resource: float = 1.0) -> float:
     sigma = 0.05 / math.sqrt(resource)
     noise = float(np.random.default_rng(seed).normal(0.0, sigma))
     return base + noise
+
+
+def demo_multi_objective(params: Dict, resource: float = 1.0):
+    """Two competing objectives for the ``pareto`` CLI demo (minimise both).
+
+    The first is the noise-free surface of :func:`demo_objective`, which is 0
+    at ``(a, b) = (1, 2)``. The second is a "cost" ``a + b`` that pulls
+    toward small values. Each objective has its own optimum, so the
+    trade-off between them forms a 1-D Pareto front.
+    """
+    a = float(params["a"])
+    b = float(params["b"])
+    loss = (a * b - 2.0) ** 2 + (a - 1.0) ** 2 + (b - 2.0) ** 2
+    return (loss, a + b)
+
+
+def zdt1(params: Dict):
+    """ZDT1 benchmark (Zitzler, Deb & Thiele, 2000) on parameters in [0, 1].
+
+    The parameters are taken in sorted-name order. The Pareto front is
+    ``f2 = 1 - sqrt(f1)`` for ``f1`` in [0, 1], reached when every parameter
+    except the first is 0.
+    """
+    x = np.array([float(params[k]) for k in sorted(params)])
+    if x.size < 2:
+        raise ValueError("zdt1 needs at least 2 parameters")
+    f1 = x[0]
+    g = 1.0 + 9.0 * x[1:].sum() / (x.size - 1)
+    return (float(f1), float(g * (1.0 - math.sqrt(f1 / g))))

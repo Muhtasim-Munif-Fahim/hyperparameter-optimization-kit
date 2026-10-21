@@ -1,6 +1,21 @@
 """hyperopt-kit: a lightweight hyperparameter optimization toolkit."""
 
 from .evaluate import RunResult, available_strategies, compare_strategies, run_search
+from .multi_objective import (
+    MOTrial,
+    crowding_distance,
+    dominates,
+    generational_distance,
+    hypervolume,
+    igd,
+    non_dominated_sort,
+    nsga2_search,
+    pareto_front_mask,
+    pareto_trials,
+    polynomial_mutation,
+    sbx_crossover,
+)
+from .objectives import demo_multi_objective, zdt1
 from .quasi_random import (
     centered_discrepancy,
     halton_search,
@@ -63,6 +78,20 @@ from .spaces import Categorical, FloatRange, IntRange, Space, parse_space
 __version__ = "0.1.0"
 
 __all__ = [
+    "MOTrial",
+    "crowding_distance",
+    "demo_multi_objective",
+    "dominates",
+    "generational_distance",
+    "hypervolume",
+    "igd",
+    "non_dominated_sort",
+    "nsga2_search",
+    "pareto_front_mask",
+    "pareto_trials",
+    "polynomial_mutation",
+    "sbx_crossover",
+    "zdt1",
     "CMAESParameters",
     "Categorical",
     "FloatRange",
