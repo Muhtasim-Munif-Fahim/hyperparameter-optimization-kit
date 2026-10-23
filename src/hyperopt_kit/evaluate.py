@@ -25,6 +25,7 @@ from .searchers import (
     successive_halving,
     tpe_search,
 )
+from .acquisition import batch_bayesian_search, gp_hedge_search
 from .quasi_random import halton_search, lhs_search, quasi_random_search
 from .spaces import Space
 
@@ -35,6 +36,8 @@ _STRATEGIES = {
     "halton": halton_search,
     "lhs": lhs_search,
     "bayesian": bayesian_search,
+    "gp_hedge": gp_hedge_search,
+    "batch_bayesian": batch_bayesian_search,
     "tpe": tpe_search,
     "cmaes": cmaes_search,
     "cem": cross_entropy_search,
@@ -61,6 +64,8 @@ _STRATEGY_KWARGS = {
     "halton": ("scramble",),
     "lhs": ("n_candidates",),
     "bayesian": ("xi", "n_initial", "n_candidates"),
+    "gp_hedge": ("acquisitions", "eta", "xi", "beta", "n_initial", "n_candidates"),
+    "batch_bayesian": ("batch_size", "acquisition", "lie", "xi", "beta", "n_initial", "n_candidates"),
     "tpe": ("gamma", "n_initial", "n_candidates", "prior_weight", "bandwidth_factor"),
     "cmaes": ("population_size", "sigma0"),
     "cem": ("population_size", "elite_fraction", "smoothing", "initial_std", "min_std", "min_probability"),

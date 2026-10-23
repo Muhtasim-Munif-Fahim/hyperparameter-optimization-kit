@@ -426,3 +426,25 @@ Checked against reference libraries: on random fronts with 2–4 objectives,
 the hypervolume matches `moocore`, and non-dominated sorting, crowding
 distance (up to pymoo's 1/n_obj averaging), IGD and GD match `pymoo`, all to
 floating-point precision.
+
+## GP acquisition portfolio (GP-Hedge) and batch Bayesian optimization
+
+`hyperopt_kit.acquisition` adds acquisition functions beyond expected improvement, and two searchers that use them:
+
+- `probability_of_improvement`, `lower_confidence_bound` (GP-LCB, the minimization form of GP-UCB), and `gp_ucb_beta` (the Srinivas et al. 2010 `beta_t` schedule).
+- `posterior_covariance` and `thompson_sample`, which draw jointly from the GP posterior.
+- `gp_hedge_search` (strategy `gp_hedge`): the Hoffman et al. 2011 portfolio over `ei`/`pi`/`lcb`/`ts`.
+  - Each round, every acquisition nominates a point.
+  - One nominee is chosen with probability softmax(`eta` × gains).
+  - Each acquisition's gain is then credited with the standardized posterior mean at its own nominee.
+- `batch_bayesian_search` (strategy `batch_bayesian`) and `propose_batch`: synchronous q-point batches.
+  - Points are chosen one after another, with a hallucinated value for each pending point (Ginsbourger et al. 2010).
+  - `lie` can be `kriging_believer`, `cl_min`, `cl_mean` or `cl_max`.
+
+```python
+from hyperopt_kit import run_search
+run_search("gp_hedge", space, objective, budget=40, seed=0, acquisitions=("ei", "pi", "lcb", "ts"))
+run_search("batch_bayesian", space, objective, budget=40, seed=0, batch_size=4, lie="cl_max")
+```
+
+Both strategies also work in the CLI: `hyperopt-kit search --strategy gp_hedge ...`.
