@@ -1,5 +1,15 @@
 """hyperopt-kit: a lightweight hyperparameter optimization toolkit."""
 
+from .acquisition import (
+    batch_bayesian_search,
+    gp_hedge_search,
+    gp_ucb_beta,
+    lower_confidence_bound,
+    posterior_covariance,
+    probability_of_improvement,
+    propose_batch,
+    thompson_sample,
+)
 from .evaluate import RunResult, available_strategies, compare_strategies, run_search
 from .multi_objective import (
     MOTrial,
@@ -78,6 +88,14 @@ from .spaces import Categorical, FloatRange, IntRange, Space, parse_space
 __version__ = "0.1.0"
 
 __all__ = [
+    "batch_bayesian_search",
+    "gp_hedge_search",
+    "gp_ucb_beta",
+    "lower_confidence_bound",
+    "posterior_covariance",
+    "probability_of_improvement",
+    "propose_batch",
+    "thompson_sample",
     "MOTrial",
     "crowding_distance",
     "demo_multi_objective",
