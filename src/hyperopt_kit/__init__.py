@@ -35,6 +35,13 @@ from .quasi_random import (
     quasi_random_search,
 )
 from .report import render_report, write_report
+from .sensitivity import (
+    SobolResult,
+    format_sobol_table,
+    saltelli_matrices,
+    sobol_indices,
+    surrogate_sobol_importance,
+)
 from .searchers import (
     CMAESParameters,
     GaussianProcess,
@@ -165,6 +172,11 @@ __all__ = [
     "geometric_cooling_schedule",
     "metropolis_acceptance",
     "render_report",
+    "SobolResult",
+    "format_sobol_table",
+    "saltelli_matrices",
+    "sobol_indices",
+    "surrogate_sobol_importance",
     "run_search",
     "select_halving_survivors",
     "successive_halving",

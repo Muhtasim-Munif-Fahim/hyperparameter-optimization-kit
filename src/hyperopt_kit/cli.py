@@ -1,4 +1,4 @@
-"""Command-line interface: ``search``, ``compare``, ``report`` and ``pareto`` subcommands."""
+"""Command-line interface: ``search``, ``compare``, ``report``, ``pareto`` and ``sensitivity`` subcommands."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from .evaluate import available_strategies, compare_strategies, run_search
 from .multi_objective import hypervolume, nsga2_search, pareto_trials
 from .objectives import demo_multi_objective, demo_objective, zdt1
 from .report import render_report, write_report
+from .sensitivity import format_sobol_table, surrogate_sobol_importance
 from .spaces import parse_space
 
 
@@ -210,7 +211,64 @@ def build_parser() -> argparse.ArgumentParser:
         help="comma-separated hypervolume reference point (default: per-objective max of all trials + 10%% of range)",
     )
     p_pareto.add_argument("--json", action="store_true", help="print the front as JSON")
+
+    p_sens = sub.add_parser(
+        "sensitivity",
+        help="run a search, then rank hyperparameters by Sobol indices on a GP surrogate",
+    )
+    p_sens.add_argument("--space", required=True, help="JSON space spec, or @path/to/space.json")
+    p_sens.add_argument("--objective", default="demo", help="'demo' or 'module:function'")
+    p_sens.add_argument("--budget", type=_positive_int, required=True, help="number of evaluations")
+    p_sens.add_argument("--strategy", default="random", choices=available_strategies())
+    p_sens.add_argument("--seed", type=int, default=None)
+    p_sens.add_argument(
+        "--n-samples", type=_positive_int, default=1024,
+        help="Saltelli base sample size (surrogate is queried n*(d+2) times)",
+    )
+    p_sens.add_argument(
+        "--bootstrap", type=int, default=0, help="bootstrap resamples for confidence intervals"
+    )
+    p_sens.add_argument("--json", action="store_true", help="print indices as JSON")
     return parser
+
+
+def _run_sensitivity(args, parser) -> int:
+    import numpy as np
+
+    try:
+        space = _load_space(args.space)
+        objective = _load_objective(args.objective)
+    except Exception as exc:
+        parser.error(str(exc))
+    if args.n_samples < 2:
+        parser.error("--n-samples must be >= 2")
+    if args.bootstrap < 0:
+        parser.error("--bootstrap must be >= 0")
+    result = run_search(args.strategy, space, objective, args.budget, seed=args.seed)
+    try:
+        sobol = surrogate_sobol_importance(
+            result.trials,
+            space,
+            n=args.n_samples,
+            rng=np.random.default_rng(args.seed),
+            n_bootstrap=args.bootstrap,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.json:
+        print(json.dumps({
+            "strategy": result.strategy,
+            "trials": len(result.trials),
+            "best_score": result.best_score,
+            "variance": sobol.variance,
+            "indices": sobol.as_dict(),
+        }, default=str))
+        return 0
+    print(f"strategy: {result.strategy}")
+    print(f"trials: {len(result.trials)} (surrogate fitted on {sobol.extra['n_trials']})")
+    print(f"best score: {result.best_score:.6g}")
+    print(format_sobol_table(sobol))
+    return 0
 
 
 def _run_pareto(args, parser) -> int:
@@ -266,6 +324,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "pareto":
         return _run_pareto(args, parser)
+    if args.command == "sensitivity":
+        return _run_sensitivity(args, parser)
     try:
         space = _load_space(args.space)
         objective = _load_objective(args.objective)

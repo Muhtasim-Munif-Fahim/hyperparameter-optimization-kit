@@ -448,3 +448,36 @@ run_search("batch_bayesian", space, objective, budget=40, seed=0, batch_size=4, 
 ```
 
 Both strategies also work in the CLI: `hyperopt-kit search --strategy gp_hedge ...`.
+
+## Sobol hyperparameter importance
+
+`hyperopt_kit.sensitivity` ranks hyperparameters by how much of the objective's
+variance they explain, using variance-based Sobol indices:
+
+- **S1** (first order): share of variance explained by a parameter alone.
+- **ST** (total order): S1 plus every interaction the parameter takes part in;
+  `ST - S1` is the interaction share.
+
+`sobol_indices(func, d, n)` uses the Saltelli (2010) first-order and Jansen (1999)
+total-order estimators on `[0, 1]^d` (`n * (d + 2)` evaluations, optional bootstrap
+intervals). `surrogate_sobol_importance(trials, space)` fits the kit's Gaussian
+process to completed trials (highest fidelity only for multi-fidelity runs, integer
+and categorical values snapped to admissible points) and estimates the indices on the
+surrogate mean, so no extra objective calls are needed.
+
+```python
+from hyperopt_kit import run_search, surrogate_sobol_importance, format_sobol_table
+
+result = run_search("random", space, objective, budget=60, seed=0)
+sobol = surrogate_sobol_importance(result.trials, space, n=2048, n_bootstrap=200)
+print(format_sobol_table(sobol))
+```
+
+```bash
+hyperopt-kit sensitivity --space @space.json --budget 60 --strategy random \
+  --n-samples 2048 --bootstrap 200 [--json]
+```
+
+The indices describe the surrogate, so they are only as reliable as the GP fit:
+use a space-filling strategy (random / quasi-random) with enough trials when the
+goal is importance analysis rather than optimization.
