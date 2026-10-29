@@ -78,6 +78,7 @@ def test_available_strategies_lists_tpe_cmaes_hyperband_and_bohb():
         "gp_hedge",
         "batch_bayesian",
         "tpe",
+        "turbo",
         "cmaes",
         "cem",
         "cross_entropy",

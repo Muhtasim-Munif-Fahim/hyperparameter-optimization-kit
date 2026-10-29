@@ -94,6 +94,15 @@ from .spaces import Categorical, FloatRange, IntRange, Space, parse_space
 
 __version__ = "0.1.0"
 
+from .turbo import (
+    TurboState,
+    trust_region_bounds,
+    turbo_candidates,
+    turbo_initial_state,
+    turbo_search,
+    update_turbo_state,
+)
+
 __all__ = [
     "batch_bayesian_search",
     "gp_hedge_search",
@@ -183,6 +192,12 @@ __all__ = [
     "successive_halving_rungs",
     "tpe_log_density_ratio",
     "tpe_search",
+    "TurboState",
+    "trust_region_bounds",
+    "turbo_candidates",
+    "turbo_initial_state",
+    "turbo_search",
+    "update_turbo_state",
     "tpe_split",
     "write_report",
 ]

@@ -28,6 +28,7 @@ from .searchers import (
 from .acquisition import batch_bayesian_search, gp_hedge_search
 from .quasi_random import halton_search, lhs_search, quasi_random_search
 from .spaces import Space
+from .turbo import turbo_search
 
 _STRATEGIES = {
     "grid": grid_search,
@@ -39,6 +40,7 @@ _STRATEGIES = {
     "gp_hedge": gp_hedge_search,
     "batch_bayesian": batch_bayesian_search,
     "tpe": tpe_search,
+    "turbo": turbo_search,
     "cmaes": cmaes_search,
     "cem": cross_entropy_search,
     "cross_entropy": cross_entropy_search,
@@ -67,6 +69,16 @@ _STRATEGY_KWARGS = {
     "gp_hedge": ("acquisitions", "eta", "xi", "beta", "n_initial", "n_candidates"),
     "batch_bayesian": ("batch_size", "acquisition", "lie", "xi", "beta", "n_initial", "n_candidates"),
     "tpe": ("gamma", "n_initial", "n_candidates", "prior_weight", "bandwidth_factor"),
+    "turbo": (
+        "n_initial",
+        "n_candidates",
+        "length_init",
+        "length_min",
+        "length_max",
+        "success_tolerance",
+        "failure_tolerance",
+        "max_gp_points",
+    ),
     "cmaes": ("population_size", "sigma0"),
     "cem": ("population_size", "elite_fraction", "smoothing", "initial_std", "min_std", "min_probability"),
     "cross_entropy": ("population_size", "elite_fraction", "smoothing", "initial_std", "min_std", "min_probability"),
