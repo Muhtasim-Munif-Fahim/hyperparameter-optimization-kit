@@ -61,6 +61,14 @@ fidelity rung.
   while it ranks in the running top `1/eta` of that rung (ASHA-style). This
   is not a second GP-EI optimizer, and it is not the closed cohort inside
   `successive_halving`.
+- **Median stopping rule** (`median_stopping`, `hyperopt_kit.median_stopping`):
+  random configurations climb the same fidelity ladder. After rung `k`, a
+  configuration is stopped if its best score so far is strictly worse than the
+  median of earlier configurations' running averages at rung `k`
+  (Golovin et al., 2017, the Google Vizier default). `grace_rungs` and
+  `min_samples` control how early it may prune.
+  `median_stopping_decision(curve, reference_curves)` exposes the rule on its
+  own, so it can be used in custom training loops.
 - **BOHB** (`hyperopt_kit.searchers`): the same Hyperband brackets, but new
   configurations are proposed by a multivariate product-kernel density
   (Gaussian on numeric coordinates, Aitchison–Aitken on categoricals) fit to

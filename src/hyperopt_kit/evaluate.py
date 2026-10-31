@@ -29,6 +29,7 @@ from .acquisition import batch_bayesian_search, gp_hedge_search
 from .quasi_random import halton_search, lhs_search, quasi_random_search
 from .spaces import Space
 from .turbo import turbo_search
+from .median_stopping import median_stopping_search
 
 _STRATEGIES = {
     "grid": grid_search,
@@ -57,6 +58,7 @@ _STRATEGIES = {
     "bohb": bohb_search,
     "successive_halving": successive_halving,
     "random_successive_halving": random_successive_halving,
+    "median_stopping": median_stopping_search,
 }
 
 _STRATEGY_KWARGS = {
@@ -114,6 +116,7 @@ _STRATEGY_KWARGS = {
     ),
     "successive_halving": ("eta", "min_resource", "max_resource", "n_candidates"),
     "random_successive_halving": ("eta", "min_resource", "max_resource"),
+    "median_stopping": ("eta", "min_resource", "max_resource", "grace_rungs", "min_samples"),
 }
 
 

@@ -11,6 +11,11 @@ from .acquisition import (
     thompson_sample,
 )
 from .evaluate import RunResult, available_strategies, compare_strategies, run_search
+from .median_stopping import (
+    MedianStoppingDecision,
+    median_stopping_decision,
+    median_stopping_search,
+)
 from .multi_objective import (
     MOTrial,
     crowding_distance,
@@ -200,4 +205,7 @@ __all__ = [
     "update_turbo_state",
     "tpe_split",
     "write_report",
+    "MedianStoppingDecision",
+    "median_stopping_decision",
+    "median_stopping_search",
 ]
