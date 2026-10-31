@@ -348,6 +348,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             "min_resource": mf_kwargs["min_resource"],
             "max_resource": mf_kwargs["max_resource"],
         },
+        "median_stopping": {
+            "eta": mf_kwargs["eta"],
+            "min_resource": mf_kwargs["min_resource"],
+            "max_resource": mf_kwargs["max_resource"],
+        },
         "tpe": {"gamma": args.gamma},
         "cmaes": {"sigma0": args.sigma0},
         "bohb": {
