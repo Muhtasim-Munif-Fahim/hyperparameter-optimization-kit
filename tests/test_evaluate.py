@@ -90,6 +90,8 @@ def test_available_strategies_lists_tpe_cmaes_hyperband_and_bohb():
         "simulated_annealing",
         "nm",
         "nelder_mead",
+        "hj",
+        "hooke_jeeves",
         "pbt",
         "hyperband",
         "bohb",
