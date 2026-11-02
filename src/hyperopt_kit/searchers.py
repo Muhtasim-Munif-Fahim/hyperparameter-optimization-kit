@@ -3011,6 +3011,166 @@ def nelder_mead_search(
 nm_search = nelder_mead_search
 
 
+def _hj_key(params: Dict[str, Any]) -> Tuple:
+    return tuple((k, repr(v)) for k, v in params.items())
+
+
+def hooke_jeeves_search(
+    space: Dict[str, Space],
+    objective: ScoreFn,
+    budget: int,
+    rng: Optional[np.random.Generator] = None,
+    stop_when: Stopper = None,
+    *,
+    n_initial: Optional[int] = None,
+    initial_step: float = 0.25,
+    step_reduction: float = 0.5,
+    min_step: float = 1e-3,
+    explore_categoricals: bool = True,
+) -> List[Trial]:
+    """Hooke-Jeeves pattern search (Hooke & Jeeves, 1961) in normalized space.
+
+    1. ``n_initial`` uniform random configurations (default
+       ``max(1, min(10, budget // 10))``) are evaluated and the best becomes
+       the base point.
+    2. *Exploratory move*: each FloatRange / IntRange coordinate of the
+       normalized unit cube is tried at ``+step`` and then ``-step``. The
+       first improvement is kept before the next coordinate is tried. With
+       ``explore_categoricals=True`` every other choice of each Categorical
+       is also tried and the best improving choice is kept.
+    3. *Pattern move*: when exploration improves on the base, the search
+       jumps to ``new + (new - base)`` (clipped to the cube), explores
+       around that point, and keeps accelerating while it improves. A
+       pattern step that moves less than ``step / 2`` (clipping at the
+       boundary) ends the acceleration, so the search cannot creep.
+    4. When exploration around the base fails, ``step`` is multiplied by
+       ``step_reduction``. Once it drops below ``min_step`` the search
+       restarts from a fresh random configuration with ``initial_step``.
+
+    Repeated configurations are answered from a cache, so they do not use
+    budget (IntRange rounding often maps nearby points to the same value).
+    Scores are minimized and non-finite scores count as ``+inf``. ``budget``
+    counts distinct objective evaluations.
+    """
+    _validate_space(space)
+    if not _is_strict_int(budget) or int(budget) < 1:
+        raise ValueError("budget must be >= 1")
+    budget = int(budget)
+    if n_initial is not None and (not _is_strict_int(n_initial) or int(n_initial) < 1):
+        raise ValueError("n_initial must be a positive integer")
+    if not _is_real_number(initial_step) or not 0.0 < float(initial_step) <= 1.0:
+        raise ValueError("initial_step must be in (0, 1]")
+    if not _is_real_number(step_reduction) or not 0.0 < float(step_reduction) < 1.0:
+        raise ValueError("step_reduction must be in (0, 1)")
+    if not _is_real_number(min_step) or not 0.0 < float(min_step) <= float(initial_step):
+        raise ValueError("min_step must be in (0, initial_step]")
+
+    rng = rng if rng is not None else np.random.default_rng()
+    numeric = [n for n, sp in space.items() if not isinstance(sp, Categorical)]
+    categorical = [n for n, sp in space.items() if isinstance(sp, Categorical)] if explore_categoricals else []
+    if not numeric and not categorical:
+        return random_search(space, objective, budget, rng=rng, stop_when=stop_when)
+
+    trials: List[Trial] = []
+    cache: Dict[Tuple, float] = {}
+    best_score = float("inf")
+    stall = 0
+    max_stall = 1000 * (len(numeric) + len(categorical) + 1)
+
+    def to_params(x: np.ndarray, cats: Dict[str, Any]) -> Dict[str, Any]:
+        out = {name: space[name].denormalize(float(v)) for name, v in zip(numeric, x)}
+        out.update(cats)
+        return {name: out[name] for name in space}
+
+    def evaluate(params: Dict[str, Any]) -> float:
+        nonlocal best_score, stall
+        key = _hj_key(params)
+        if key in cache:
+            stall += 1
+            if stall > max_stall:  # finite space exhausted
+                raise _BudgetExhausted
+            return cache[key]
+        if len(trials) >= budget:
+            raise _BudgetExhausted
+        stall = 0
+        raw = float(objective(params))
+        trials.append(Trial(len(trials), params, raw))
+        score = raw if math.isfinite(raw) else float("inf")
+        cache[key] = score
+        best_score = min(best_score, score)
+        if stop_when is not None and stop_when(best_score, len(trials)):
+            raise _BudgetExhausted
+        return score
+
+    def from_params(params: Dict[str, Any]) -> Tuple[np.ndarray, Dict[str, Any]]:
+        x = np.array([space[n].normalize(params[n]) for n in numeric], dtype=float)
+        return x, {n: params[n] for n in space if n not in numeric}
+
+    def explore(x: np.ndarray, cats: Dict[str, Any], f: float, step: float):
+        x, cats = x.copy(), dict(cats)
+        for j in range(len(numeric)):
+            for direction in (1.0, -1.0):
+                trial_x = x.copy()
+                trial_x[j] = float(np.clip(trial_x[j] + direction * step, 0.0, 1.0))
+                if trial_x[j] == x[j]:
+                    continue
+                ft = evaluate(to_params(trial_x, cats))
+                if ft < f:
+                    x, f = trial_x, ft
+                    break
+        for name in categorical:
+            best_choice, best_f = cats[name], f
+            for choice in space[name].choices:
+                if choice == cats[name]:
+                    continue
+                ft = evaluate(to_params(x, {**cats, name: choice}))
+                if ft < best_f:
+                    best_choice, best_f = choice, ft
+            cats[name], f = best_choice, best_f
+        return x, cats, f
+
+    n0 = int(n_initial) if n_initial is not None else max(1, min(10, budget // 10))
+    try:
+        start = None
+        for _ in range(min(n0, budget)):
+            params = _sample_config(space, rng)
+            f0 = evaluate(params)
+            if start is None or f0 < start[1]:
+                start = (params, f0)
+        while True:
+            base_x, base_cats = from_params(start[0])
+            base_f = start[1]
+            step = float(initial_step)
+            while step >= float(min_step):
+                new_x, new_cats, new_f = explore(base_x, base_cats, base_f, step)
+                if new_f < base_f:
+                    while True:  # pattern moves
+                        pattern_x = np.clip(2.0 * new_x - base_x, 0.0, 1.0)
+                        base_x, base_cats, base_f = new_x, new_cats, new_f
+                        fp = evaluate(to_params(pattern_x, base_cats))
+                        cand_x, cand_cats, cand_f = explore(pattern_x, base_cats, fp, step)
+                        if cand_f >= base_f:
+                            break
+                        moved = float(np.max(np.abs(cand_x - base_x))) if cand_x.size else 0.0
+                        if moved < 0.5 * step and cand_cats == base_cats:
+                            # Clipping at the cube boundary can produce a
+                            # sub-step creep; accept the point and go back
+                            # to exploring (and eventually shrinking).
+                            base_x, base_cats, base_f = cand_x, cand_cats, cand_f
+                            break
+                        new_x, new_cats, new_f = cand_x, cand_cats, cand_f
+                else:
+                    step *= float(step_reduction)
+            params = _sample_config(space, rng)
+            start = (params, evaluate(params))
+    except _BudgetExhausted:
+        pass
+    return trials
+
+
+hj_search = hooke_jeeves_search
+
+
 def cross_entropy_update(
     mean: np.ndarray,
     std: np.ndarray,
