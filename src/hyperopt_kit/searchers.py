@@ -3171,6 +3171,136 @@ def hooke_jeeves_search(
 hj_search = hooke_jeeves_search
 
 
+def one_plus_one_es_search(
+    space: Dict[str, Space],
+    objective: ScoreFn,
+    budget: int,
+    rng: Optional[np.random.Generator] = None,
+    stop_when: Stopper = None,
+    *,
+    n_initial: Optional[int] = None,
+    sigma0: float = 0.2,
+    min_sigma: float = 1e-3,
+    max_sigma: float = 0.5,
+    success_target: float = 0.2,
+    adaptation: Optional[float] = None,
+    categorical_rate: Optional[float] = None,
+) -> List[Trial]:
+    """(1+1) evolution strategy with the 1/5th success rule (Rechenberg, 1973).
+
+    The search keeps a single parent in the normalized unit cube. Each step
+    draws one offspring ``x + sigma * N(0, I)`` (clipped to the cube) and
+    resamples each Categorical with probability ``categorical_rate``
+    (default ``1 / len(space)``). The offspring replaces the parent when its
+    score is no worse (``<=``, which lets the parent drift across plateaus).
+
+    The step size follows the smooth 1/5th success rule (Kern et al., 2004):
+    on success ``sigma *= exp(a * (1 - p))`` and on failure
+    ``sigma *= exp(-a * p)`` with ``p = success_target``. The stationary
+    success rate is therefore exactly ``p``. ``a`` defaults to
+    ``1 / sqrt(d + 1)`` for ``d`` numeric dimensions. ``sigma`` is capped at
+    ``max_sigma``, and once it falls below ``min_sigma`` the search restarts
+    from a fresh random configuration with ``sigma0``.
+
+    ``n_initial`` uniform random configurations (default
+    ``max(1, min(10, budget // 10))``) seed the first parent. Scores are
+    minimized and non-finite scores count as ``+inf``. ``budget`` counts
+    objective evaluations.
+    """
+    _validate_space(space)
+    if not _is_strict_int(budget) or int(budget) < 1:
+        raise ValueError("budget must be >= 1")
+    budget = int(budget)
+    if n_initial is not None and (not _is_strict_int(n_initial) or int(n_initial) < 1):
+        raise ValueError("n_initial must be a positive integer")
+    if not _is_real_number(max_sigma) or not 0.0 < float(max_sigma) <= 1.0:
+        raise ValueError("max_sigma must be in (0, 1]")
+    if not _is_real_number(sigma0) or not 0.0 < float(sigma0) <= float(max_sigma):
+        raise ValueError("sigma0 must be in (0, max_sigma]")
+    if not _is_real_number(min_sigma) or not 0.0 < float(min_sigma) < float(sigma0):
+        raise ValueError("min_sigma must be in (0, sigma0)")
+    if not _is_real_number(success_target) or not 0.0 < float(success_target) < 1.0:
+        raise ValueError("success_target must be in (0, 1)")
+    if adaptation is not None and (not _is_real_number(adaptation) or float(adaptation) <= 0.0):
+        raise ValueError("adaptation must be > 0")
+    if categorical_rate is not None and (
+        not _is_real_number(categorical_rate) or not 0.0 <= float(categorical_rate) <= 1.0
+    ):
+        raise ValueError("categorical_rate must be in [0, 1]")
+
+    rng = rng if rng is not None else np.random.default_rng()
+    numeric = [n for n, sp in space.items() if not isinstance(sp, Categorical)]
+    categorical = [n for n, sp in space.items() if isinstance(sp, Categorical)]
+    p_target = float(success_target)
+    a = float(adaptation) if adaptation is not None else 1.0 / math.sqrt(len(numeric) + 1)
+    up, down = math.exp(a * (1.0 - p_target)), math.exp(-a * p_target)
+    cat_rate = float(categorical_rate) if categorical_rate is not None else 1.0 / len(space)
+
+    trials: List[Trial] = []
+    best_score = float("inf")
+
+    def evaluate(params: Dict[str, Any]) -> float:
+        nonlocal best_score
+        if len(trials) >= budget:
+            raise _BudgetExhausted
+        raw = float(objective(params))
+        trials.append(Trial(len(trials), params, raw))
+        score = raw if math.isfinite(raw) else float("inf")
+        best_score = min(best_score, score)
+        if stop_when is not None and stop_when(best_score, len(trials)):
+            raise _BudgetExhausted
+        return score
+
+    def mutate(params: Dict[str, Any], sigma: float) -> Dict[str, Any]:
+        child = dict(params)
+        if numeric:
+            x = np.array([space[n].normalize(params[n]) for n in numeric], dtype=float)
+            x = np.clip(x + sigma * rng.standard_normal(len(numeric)), 0.0, 1.0)
+            for name, v in zip(numeric, x):
+                child[name] = space[name].denormalize(float(v))
+        changed = False
+        for name in categorical:
+            if len(space[name].choices) > 1 and rng.random() < cat_rate:
+                others = [c for c in space[name].choices if c != params[name]]
+                child[name] = others[int(rng.integers(len(others)))]
+                changed = True
+        if not numeric and not changed and categorical:
+            # Purely categorical space: always change at least one choice.
+            name = categorical[int(rng.integers(len(categorical)))]
+            others = [c for c in space[name].choices if c != params[name]]
+            if others:
+                child[name] = others[int(rng.integers(len(others)))]
+        return child
+
+    n0 = int(n_initial) if n_initial is not None else max(1, min(10, budget // 10))
+    try:
+        parent, parent_f = None, float("inf")
+        for _ in range(min(n0, budget)):
+            params = _sample_config(space, rng)
+            f0 = evaluate(params)
+            if parent is None or f0 < parent_f:
+                parent, parent_f = params, f0
+        sigma = float(sigma0)
+        while True:
+            child = mutate(parent, sigma)
+            fc = evaluate(child)
+            if fc <= parent_f:
+                parent, parent_f = child, fc
+                sigma = min(sigma * up, float(max_sigma))
+            else:
+                sigma *= down
+            if sigma < float(min_sigma):
+                parent = _sample_config(space, rng)
+                parent_f = evaluate(parent)
+                sigma = float(sigma0)
+    except _BudgetExhausted:
+        pass
+    return trials
+
+
+es_search = one_plus_one_es_search
+
+
 def cross_entropy_update(
     mean: np.ndarray,
     std: np.ndarray,
