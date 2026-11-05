@@ -92,6 +92,8 @@ def test_available_strategies_lists_tpe_cmaes_hyperband_and_bohb():
         "nelder_mead",
         "hj",
         "hooke_jeeves",
+        "es",
+        "one_plus_one_es",
         "pbt",
         "hyperband",
         "bohb",
