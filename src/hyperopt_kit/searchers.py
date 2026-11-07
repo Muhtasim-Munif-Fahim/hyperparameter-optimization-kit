@@ -28,6 +28,7 @@ cooling, a Kirkpatrick-calibrated start temperature and shrinking steps.
 ``nelder_mead_search`` runs the derivative-free downhill simplex (Nelder &
 Mead, 1965) on the normalized numeric parameters with box projection,
 optional dimension-adaptive coefficients (Gao & Han, 2012) and restarts.
+``powell_search`` runs Powell's conjugate-direction method (Powell, 1964) on the normalized unit cube with golden-section line searches;
 ``cross_entropy_search`` runs the cross-entropy method (Rubinstein, 1999):
 sample a population from a diagonal Gaussian (numeric) / categorical
 distribution, refit it to the elite fraction with smoothing, repeat.
@@ -3299,6 +3300,175 @@ def one_plus_one_es_search(
 
 
 es_search = one_plus_one_es_search
+
+
+def _powell_line_bounds(x: np.ndarray, direction: np.ndarray) -> Tuple[float, float]:
+    """Largest ``[lo, hi]`` such that ``x + t * direction`` stays in ``[0, 1]^d``."""
+    lo, hi = -float("inf"), float("inf")
+    for xi, di in zip(x, direction):
+        if abs(di) < 1e-15:
+            if not (0.0 <= xi <= 1.0):
+                return 0.0, 0.0
+            continue
+        a = (0.0 - xi) / di
+        b = (1.0 - xi) / di
+        lo = max(lo, min(a, b))
+        hi = min(hi, max(a, b))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi < lo:
+        return 0.0, 0.0
+    return float(lo), float(hi)
+
+
+def powell_search(
+    space: Dict[str, Space],
+    objective: ScoreFn,
+    budget: int,
+    rng: Optional[np.random.Generator] = None,
+    stop_when: Stopper = None,
+    *,
+    n_initial: Optional[int] = None,
+    line_evals: int = 8,
+    xtol: float = 1e-4,
+) -> List[Trial]:
+    """Powell's conjugate-direction method (Powell, 1964) in normalized space.
+
+    Numeric FloatRange / IntRange parameters live in the unit cube. The
+    search starts from the best of ``n_initial`` random configurations
+    (default ``max(1, min(10, budget // 10))``) with the coordinate basis
+    as the initial direction set. Each cycle:
+
+    1. Minimises along every direction with a golden-section line search
+       projected onto the feasible segment inside the cube
+       (``line_evals`` objective calls per direction, default 8).
+    2. Forms the displacement ``x_end - x_start`` as a new conjugate
+       direction, replaces the direction of largest improvement, and
+       minimises along the new direction once more.
+
+    Categoricals are held fixed for a cycle and re-sampled from a fresh
+    random configuration when the cycle displacement falls below ``xtol``
+    (restart). A purely categorical space falls back to
+    :func:`random_search`. Scores are minimized; non-finite scores count
+    as ``+inf``. ``budget`` counts distinct objective evaluations (a
+    configuration cache skips repeats caused by IntRange rounding).
+    """
+    _validate_space(space)
+    if not _is_strict_int(budget) or int(budget) < 1:
+        raise ValueError("budget must be >= 1")
+    budget = int(budget)
+    if n_initial is not None and (not _is_strict_int(n_initial) or int(n_initial) < 1):
+        raise ValueError("n_initial must be a positive integer")
+    if not _is_strict_int(line_evals) or int(line_evals) < 3:
+        raise ValueError("line_evals must be an integer >= 3")
+    if not _is_real_number(xtol) or float(xtol) < 0.0:
+        raise ValueError("xtol must be a non-negative number")
+
+    rng = rng if rng is not None else np.random.default_rng()
+    numeric = [n for n, sp in space.items() if not isinstance(sp, Categorical)]
+    if not numeric:
+        return random_search(space, objective, budget, rng=rng, stop_when=stop_when)
+
+    trials: List[Trial] = []
+    cache: Dict[Tuple, float] = {}
+    best_score = float("inf")
+    phi = (math.sqrt(5.0) - 1.0) / 2.0  # 1/phi golden ratio conjugate
+
+    def to_params(x: np.ndarray, cats: Dict[str, Any]) -> Dict[str, Any]:
+        out = {name: space[name].denormalize(float(v)) for name, v in zip(numeric, x)}
+        out.update(cats)
+        return {name: out[name] for name in space}
+
+    def evaluate(params: Dict[str, Any]) -> float:
+        nonlocal best_score
+        key = _hj_key(params)
+        if key in cache:
+            return cache[key]
+        if len(trials) >= budget:
+            raise _BudgetExhausted
+        raw = float(objective(params))
+        trials.append(Trial(len(trials), params, raw))
+        score = raw if math.isfinite(raw) else float("inf")
+        cache[key] = score
+        best_score = min(best_score, score)
+        if stop_when is not None and stop_when(best_score, len(trials)):
+            raise _BudgetExhausted
+        return score
+
+    def from_params(params: Dict[str, Any]) -> Tuple[np.ndarray, Dict[str, Any]]:
+        x = np.array([space[n].normalize(params[n]) for n in numeric], dtype=float)
+        return x, {n: params[n] for n in space if n not in numeric}
+
+    def line_search(x: np.ndarray, cats: Dict[str, Any], direction: np.ndarray, f0: float):
+        direction = np.asarray(direction, dtype=float)
+        norm = float(np.linalg.norm(direction))
+        if norm < 1e-15:
+            return x, f0
+        direction = direction / norm
+        lo, hi = _powell_line_bounds(x, direction)
+        if hi - lo < 1e-15:
+            return x, f0
+        # Golden-section search on [lo, hi].
+        a, b = lo, hi
+        c = b - phi * (b - a)
+        d = a + phi * (b - a)
+        fc = evaluate(to_params(np.clip(x + c * direction, 0.0, 1.0), cats))
+        fd = evaluate(to_params(np.clip(x + d * direction, 0.0, 1.0), cats))
+        for _ in range(max(0, int(line_evals) - 2)):
+            if fc > fd:
+                a = c
+                c, fc = d, fd
+                d = a + phi * (b - a)
+                fd = evaluate(to_params(np.clip(x + d * direction, 0.0, 1.0), cats))
+            else:
+                b = d
+                d, fd = c, fc
+                c = b - phi * (b - a)
+                fc = evaluate(to_params(np.clip(x + c * direction, 0.0, 1.0), cats))
+        if fc <= fd and fc <= f0:
+            return np.clip(x + c * direction, 0.0, 1.0), fc
+        if fd < f0:
+            return np.clip(x + d * direction, 0.0, 1.0), fd
+        return x, f0
+
+    n0 = int(n_initial) if n_initial is not None else max(1, min(10, budget // 10))
+    d = len(numeric)
+    try:
+        start = None
+        for _ in range(min(n0, budget)):
+            params = _sample_config(space, rng)
+            f0 = evaluate(params)
+            if start is None or f0 < start[1]:
+                start = (params, f0)
+        assert start is not None
+        while True:
+            x, cats = from_params(start[0])
+            f = start[1]
+            directions = [np.eye(d)[i] for i in range(d)]
+            while True:
+                x0, f0 = x.copy(), f
+                delta = np.zeros(d)
+                for i, direction in enumerate(directions):
+                    x_new, f_new = line_search(x, cats, direction, f)
+                    delta[i] = f - f_new
+                    x, f = x_new, f_new
+                # New conjugate direction = total displacement.
+                disp = x - x0
+                if float(np.linalg.norm(disp)) < float(xtol):
+                    break
+                x, f = line_search(x, cats, disp, f)
+                # Replace the direction of largest decrease.
+                j = int(np.argmax(delta))
+                directions[j] = disp / (np.linalg.norm(disp) + 1e-15)
+                if float(np.linalg.norm(x - x0)) < float(xtol):
+                    break
+            # Restart from a fresh random point (new categoricals too).
+            params = _sample_config(space, rng)
+            start = (params, evaluate(params))
+    except _BudgetExhausted:
+        pass
+    return trials
+
+
+powell = powell_search
 
 
 def cross_entropy_update(
