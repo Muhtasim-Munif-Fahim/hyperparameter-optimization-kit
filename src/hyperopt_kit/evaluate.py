@@ -32,6 +32,7 @@ from .acquisition import batch_bayesian_search, gp_hedge_search
 from .quasi_random import halton_search, lhs_search, quasi_random_search
 from .spaces import Space
 from .turbo import turbo_search
+from .spsa import spsa_search
 from .median_stopping import median_stopping_search
 
 _STRATEGIES = {
@@ -62,6 +63,7 @@ _STRATEGIES = {
     "one_plus_one_es": one_plus_one_es_search,
     "powell": powell_search,
     "powell_search": powell_search,
+    "spsa": spsa_search,
     "pbt": pbt_search,
     "hyperband": hyperband_search,
     "bohb": bohb_search,
@@ -107,6 +109,7 @@ _STRATEGY_KWARGS = {
     "one_plus_one_es": ("n_initial", "sigma0", "min_sigma", "max_sigma", "success_target", "adaptation", "categorical_rate"),
     "powell": ("n_initial", "line_evals", "xtol"),
     "powell_search": ("n_initial", "line_evals", "xtol"),
+    "spsa": ("c", "initial_step", "alpha", "gamma", "stability", "evaluate_iterate", "tol"),
     "pbt": (
         "population_size",
         "exploit_interval",

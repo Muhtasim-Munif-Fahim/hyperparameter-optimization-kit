@@ -101,6 +101,7 @@ from .searchers import (
     tpe_search,
     tpe_split,
 )
+from .spsa import spsa_gains, spsa_search
 from .spaces import Categorical, FloatRange, IntRange, Space, parse_space
 
 __version__ = "0.1.0"
@@ -115,6 +116,8 @@ from .turbo import (
 )
 
 __all__ = [
+    "spsa_gains",
+    "spsa_search",
     "batch_bayesian_search",
     "gp_hedge_search",
     "gp_ucb_beta",
