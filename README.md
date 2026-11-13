@@ -499,3 +499,25 @@ hyperopt-kit sensitivity --space @space.json --budget 60 --strategy random \
 The indices describe the surrogate, so they are only as reliable as the GP fit:
 use a space-filling strategy (random / quasi-random) with enough trials when the
 goal is importance analysis rather than optimization.
+
+## Morris elementary-effects screening
+
+`hyperopt_kit.morris` is the cheap screening companion to Sobol indices
+(Morris 1991; `mu*` and trajectory selection from Campolongo et al. 2007).
+It costs `r * (d + 1)` evaluations: `r` one-at-a-time trajectories on a
+`p`-level grid (step `delta = p / (2 (p - 1))`). For every parameter it reports
+`mu*` (mean absolute elementary effect, the importance measure), the signed
+`mu`, and `sigma` (spread of the effects; large `sigma / mu*` means non-linear
+or interacting). `n_candidates > r` keeps the `r` most spread trajectories from a
+larger pool; `n_bootstrap` gives an interval on `mu*`.
+
+```python
+from hyperopt_kit import morris_hyperparameter_screening, morris_screening, format_morris_table
+
+res = morris_hyperparameter_screening(space, objective, r=10, p=4, n_candidates=50)
+print(format_morris_table(res))          # sorted by mu*
+morris_screening(lambda X: X @ [3.0, 0.0], d=2, r=8).mu_star   # [3, 0]
+```
+
+Unlike `surrogate_sobol_importance` it calls the real objective (no surrogate),
+so it is the better choice when a few dozen evaluations are affordable.

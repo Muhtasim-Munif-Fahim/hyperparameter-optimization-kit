@@ -40,6 +40,14 @@ from .quasi_random import (
     quasi_random_search,
 )
 from .report import render_report, write_report
+from .morris import (
+    MorrisResult,
+    format_morris_table,
+    morris_elementary_effects,
+    morris_hyperparameter_screening,
+    morris_screening,
+    morris_trajectories,
+)
 from .sensitivity import (
     SobolResult,
     format_sobol_table,
@@ -202,6 +210,12 @@ __all__ = [
     "metropolis_acceptance",
     "render_report",
     "SobolResult",
+    "MorrisResult",
+    "format_morris_table",
+    "morris_elementary_effects",
+    "morris_hyperparameter_screening",
+    "morris_screening",
+    "morris_trajectories",
     "format_sobol_table",
     "saltelli_matrices",
     "sobol_indices",
